@@ -1,6 +1,6 @@
 # Constraint Decay
 
-Reproducibility package for **"Constraint Decay: The Fragility of LLM Agents in Backend Code Generation"**.
+Reproducibility package for **"Constraint Decay: The Fragility of LLM Agents in Backend Code Generation"** — [arXiv:2605.06445](https://arxiv.org/abs/2605.06445).
 
 This repository evaluates how LLM-based coding agents (Mini-SWE-Agent, OpenHands) handle structural constraints, architectural patterns, database engines, and ORMs, in multi-file REST API generation. By fixing a unified API contract (the RealWorld Conduit API) across 80 generation tasks and 20 feature-implementation tasks spanning eight web frameworks, it isolates the effect of constraint accumulation on agent performance.
 
