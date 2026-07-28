@@ -41,13 +41,9 @@ This produces:
 - **Table 1-raw**: Same as Table 1 but without verifier enforcement (Appendix E)
 - **Table 2a**: Marginal effect of each constraint via matched-pair differences (±SEM)
 - **Table 2b**: Feature-implementation pass@1 per model and agent
-- **Table 3**: Per-framework A% ranking with pass@1 subscripts — the framework
+- **Table 8**: Per-framework A% ranking with pass@1 subscripts — the framework
   leaderboard reported in the RQ2 appendix (8 frameworks × 8 model–scaffold
-  configurations, including MiniMax-M2.5 and GPT-5.4)
-
-A% is computed **per task, then averaged across tasks**. Pooling runs directly
-gives a different answer wherever a task has fewer than 3 completed runs; all
-paper numbers use the per-task convention.
+  configurations)
 
 ### RQ2 framework sensitivity figure
 
@@ -70,7 +66,7 @@ this figure: `openhands_sdk/minimax-m2.5` (covers only 4 frameworks, not a full
 sweep) and `qwen3-235b` (near-zero scores leave all frameworks within noise).
 Both remain in the Table 3 appendix leaderboard.
 
-### Subset representativeness (Appendix, `tab:more_results`)
+### Subset representativeness (Appendix A)
 
 ```bash
 uv run evaluation_subset_representativeness.py data/results           # terminal output
@@ -84,7 +80,7 @@ for every configuration evaluated on the full benchmark. Reports per-level
 all paired (full A%, subset A%) observations. Full-evaluation configurations
 are detected automatically (≥ 90% coverage of the benchmark task set).
 
-### Verifier impact (Appendix, `tab:verifier_comparison`)
+### Verifier impact (Appendix D)
 
 ```bash
 uv run evaluation_verifier_impact.py data/results           # terminal output
@@ -140,7 +136,7 @@ uv run failure_analysis_logic.py data/results --agent mini_swe_sdk --model gpt-5
   --output data/logic_subcategories_gpt-5.4.csv
 ```
 
-### Token consumption tables (Appendix, `tab:tokens_global` and `tab:tokens_per_pair`)
+### Token consumption tables (Appendix I)
 
 ```bash
 uv run evaluation_token_consumption.py data/results           # terminal output
