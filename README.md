@@ -1,4 +1,4 @@
-# Constraint Decays
+# Constraint Decay
 
 Reproducibility package for **"Constraint Decay: The Fragility of LLM Agents in Backend Code Generation"**.
 
@@ -15,6 +15,8 @@ Additionally, a zip archive containing the experiments results is available on [
 Requires Python 3.12+, [uv](https://docs.astral.sh/uv/), and Docker.
 
 ```bash
+git clone https://github.com/francdente/constraint-decay.git
+cd constraint-decay
 uv sync
 cp .env.template .env
 # fill in LLM_API_KEY, LLM_MODEL, paths
