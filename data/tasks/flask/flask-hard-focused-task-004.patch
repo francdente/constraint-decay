@@ -1,0 +1,4627 @@
+diff --git a/realworld/api/core/models.py b/realworld/api/core/models.py
+index ab01bb6..84e6a8c 100644
+--- a/realworld/api/core/models.py
++++ b/realworld/api/core/models.py
+@@ -63,20 +63,3 @@ class DBUser(BaseCamelModel):
+     image: typ.Optional[str]
+     created_date: typ.Optional[datetime] = None
+     updated_date: typ.Optional[datetime] = None
+-
+-
+-class Article(BaseCamelModel):
+-    slug: str
+-    title: str
+-    description: str
+-    body: str
+-    tag_list: list[str]
+-    created_at: datetime
+-    updated_at: datetime
+-    favorited: bool
+-    favorites_count: int
+-    author: Profile
+-
+-    @field_serializer("created_at", "updated_at", when_used="unless-none")
+-    def serialize_datetime(self, value: datetime, info):
+-        return value.isoformat()
+diff --git a/realworld/api/routes/v1/articles/__init__.py b/realworld/api/routes/v1/articles/__init__.py
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/realworld/api/routes/v1/articles/handler.py b/realworld/api/routes/v1/articles/handler.py
+deleted file mode 100644
+index 7b5f796..0000000
+--- a/realworld/api/routes/v1/articles/handler.py
++++ /dev/null
+@@ -1,484 +0,0 @@
+-import re
+-import typing as typ
+-from uuid import uuid4
+-from sqlalchemy.engine import Connection
+-from sqlalchemy.sql import text as satext
+-from realworld.api.core.models import Article, Profile, Comment
+-
+-from realworld.api.routes.v1.articles.models import (
+-    CreateArticleData,
+-    UpdateArticleData,
+-    CreateCommentData,
+-)
+-
+-#
+-# Helpers
+-#
+-
+-
+-# return a URL-friendly article slug that likely unique
+-def generate_slug(title: str) -> str:
+-    slug = re.sub(r"[^a-z0-9-_]", "", title.lower().replace(" ", "-"))
+-    return f"{slug}-{uuid4().hex[:8]}"
+-
+-
+-def _get_curr_profile_by_id(db_conn: Connection, user_id: str) -> Profile:
+-    result = db_conn.execute(
+-        satext(
+-            """
+-            SELECT username, bio, image_url
+-            FROM users
+-            WHERE id = :user_id
+-            """
+-        ).bindparams(user_id=user_id)
+-    ).fetchone()
+-
+-    return Profile(
+-        username=result.username,
+-        bio=result.bio,
+-        image=result.image_url,
+-        following=False,  # unable to follow yourself
+-    )
+-
+-
+-def _base_get_articles_query(
+-    *,
+-    article_id: typ.Optional[int] = None,
+-    slug: typ.Optional[str] = None,
+-    curr_user_id: typ.Optional[str] = None,
+-    filter_tag: typ.Optional[str] = None,
+-    author_username_filter: typ.Optional[str] = None,
+-    favorited_by_username_filter: typ.Optional[str] = None,
+-    curr_user_feed: typ.Optional[bool] = False,
+-    limit: typ.Optional[int] = 20,
+-    offset: typ.Optional[int] = 0,
+-):
+-
+-    joins = []
+-    where_clauses = []
+-    params = {
+-        "limit": limit,
+-        "offset": offset,
+-        "curr_user_id": curr_user_id,
+-    }
+-
+-    if article_id:
+-        params["article_id"] = article_id
+-        where_clauses.append("a.id = :article_id")
+-
+-    if slug:
+-        params["slug"] = slug
+-        where_clauses.append("a.slug = :slug")
+-
+-    if filter_tag:
+-        params["tag_filter"] = filter_tag
+-        where_clauses.append("t.name = :tag_filter")
+-        joins.append("JOIN article_tags at ON a.id = at.article_id")
+-        joins.append("JOIN tags t ON at.tag_id = t.id")
+-
+-    if author_username_filter:
+-        params["author_username"] = author_username_filter
+-        where_clauses.append("u.username = :author_username")
+-
+-    if favorited_by_username_filter:
+-        params["favorited_by_username"] = favorited_by_username_filter
+-        joins.append("JOIN article_favorites uff ON a.id = uff.article_id")
+-        joins.append("JOIN users uu ON uu.id = uff.user_id")
+-        where_clauses.append("uu.username = :favorited_by_username")
+-
+-    if curr_user_feed and curr_user_id:
+-        params["curr_user_id"] = curr_user_id
+-        joins.append("JOIN user_follows uf ON a.author_user_id = uf.following_user_id")
+-        where_clauses.append("uf.user_id = :curr_user_id")
+-
+-    where_clause = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+-
+-    return satext(
+-        f"""
+-            SELECT
+-                a.id,
+-                a.slug,
+-                a.title,
+-                a.description,
+-                a.body,
+-                a.created_date,
+-                a.updated_date,
+-                u.username AS author_username,
+-                u.bio AS author_bio,
+-                u.image_url AS author_image,
+-                (
+-                    SELECT COUNT(*)
+-                    FROM article_favorites f
+-                    WHERE f.article_id = a.id
+-                ) AS favorites_count,
+-                (
+-                    SELECT COUNT(*)
+-                    FROM article_favorites f
+-                    WHERE f.article_id = a.id AND f.user_id = :curr_user_id
+-                ) AS favorited_by_curr_user,
+-                (
+-                    SELECT COUNT(*)
+-                    FROM user_follows uf
+-                    WHERE uf.user_id = :curr_user_id
+-                    AND uf.following_user_id = u.id
+-                ) > 0 AS is_curr_user_following,
+-                (
+-                    SELECT ARRAY_AGG(t.name)
+-                    FROM tags t
+-                    JOIN article_tags at ON t.id = at.tag_id
+-                    WHERE at.article_id = a.id
+-                ) AS tag_list
+-            FROM articles a
+-            JOIN users u ON a.author_user_id = u.id
+-            {" ".join(joins)}
+-            {where_clause}
+-            ORDER BY a.created_date DESC
+-            LIMIT :limit
+-            OFFSET :offset
+-        """
+-    ).bindparams(**params)
+-
+-
+-#
+-# Handlers
+-#
+-
+-
+-def get_articles(
+-    db_conn: Connection,
+-    *,
+-    curr_user_id: typ.Optional[str] = None,
+-    filter_tag: typ.Optional[str] = None,
+-    author_username_filter: typ.Optional[str] = None,
+-    favorited_by_username_filter: typ.Optional[str] = None,
+-    limit: typ.Optional[int] = 20,
+-    offset: typ.Optional[int] = 0,
+-) -> typ.List[Article]:
+-    articles = db_conn.execute(
+-        _base_get_articles_query(
+-            curr_user_id=curr_user_id,
+-            filter_tag=filter_tag,
+-            author_username_filter=author_username_filter,
+-            favorited_by_username_filter=favorited_by_username_filter,
+-            limit=limit,
+-            offset=offset,
+-        )
+-    ).fetchall()
+-
+-    return [
+-        Article(
+-            id=article.id,
+-            slug=article.slug,
+-            title=article.title,
+-            description=article.description,
+-            body=article.body,
+-            tag_list=article.tag_list if article.tag_list else [],
+-            created_at=article.created_date,
+-            updated_at=article.updated_date,
+-            favorited=bool(article.favorited_by_curr_user),
+-            favorites_count=article.favorites_count,
+-            author=Profile(
+-                bio=article.author_bio,
+-                username=article.author_username,
+-                following=bool(article.is_curr_user_following),
+-                image=article.author_image,
+-            ),
+-        )
+-        for article in articles
+-    ]
+-
+-
+-def get_feed_articles(
+-    db_conn: Connection,
+-    curr_user_id: str,
+-    limit: typ.Optional[int] = 20,
+-    offset: typ.Optional[int] = 0,
+-) -> typ.List[Article]:
+-    articles = db_conn.execute(
+-        _base_get_articles_query(
+-            curr_user_id=curr_user_id,
+-            curr_user_feed=True,
+-            limit=limit,
+-            offset=offset,
+-        )
+-    ).fetchall()
+-
+-    return [
+-        Article(
+-            id=article.id,
+-            slug=article.slug,
+-            title=article.title,
+-            description=article.description,
+-            body=article.body,
+-            tag_list=article.tag_list if article.tag_list else [],
+-            created_at=article.created_date,
+-            updated_at=article.updated_date,
+-            favorited=bool(article.favorited_by_curr_user),
+-            favorites_count=article.favorites_count,
+-            author=Profile(
+-                bio=article.author_bio,
+-                username=article.author_username,
+-                following=bool(article.is_curr_user_following),
+-                image=article.author_image,
+-            ),
+-        )
+-        for article in articles
+-    ]
+-
+-
+-def get_article_by_slug(
+-    db_conn: Connection, slug: str, curr_user_id: typ.Optional[str]
+-) -> typ.Optional[Article]:
+-    article = db_conn.execute(
+-        _base_get_articles_query(slug=slug, curr_user_id=curr_user_id)
+-    ).fetchone()
+-
+-    if not article:
+-        return None
+-
+-    return Article(
+-        id=article.id,
+-        slug=article.slug,
+-        title=article.title,
+-        description=article.description,
+-        body=article.body,
+-        tag_list=article.tag_list if article.tag_list else [],
+-        created_at=article.created_date,
+-        updated_at=article.updated_date,
+-        favorited=bool(article.favorited_by_curr_user),
+-        favorites_count=article.favorites_count,
+-        author=Profile(
+-            bio=article.author_bio,
+-            username=article.author_username,
+-            following=bool(article.is_curr_user_following),
+-            image=article.author_image,
+-        ),
+-    )
+-
+-
+-def create_article(
+-    db_conn: Connection, curr_user_id: str, data: CreateArticleData
+-) -> Article:
+-    article = db_conn.execute(
+-        satext(
+-            """
+-            INSERT INTO articles (author_user_id, slug, title, description, body)
+-            VALUES (:author_user_id, :slug, :title, :description, :body)
+-            RETURNING id, slug
+-            """
+-        ).bindparams(
+-            author_user_id=curr_user_id,
+-            slug=generate_slug(data.title),
+-            title=data.title,
+-            description=data.description,
+-            body=data.body,
+-        )
+-    ).fetchone()
+-
+-    if data.tag_list:
+-        db_conn.execute(
+-            satext(
+-                """
+-                WITH upserted_tags AS (
+-                    INSERT INTO tags (name)
+-                    VALUES (:name)
+-                    ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+-                    RETURNING id
+-                )
+-                INSERT INTO article_tags (article_id, tag_id)
+-                SELECT :article_id, id
+-                FROM upserted_tags
+-                """
+-            ),
+-            [{"name": tag, "article_id": article.id} for tag in data.tag_list],
+-        )
+-
+-    return get_article_by_slug(db_conn, article.slug, curr_user_id)
+-
+-
+-def update_article(
+-    db_conn: Connection, curr_slug: str, curr_user_id: str, data: UpdateArticleData
+-) -> Article:
+-
+-    update_str = ""
+-    params = {}
+-    new_slug = None
+-    for key in ("title", "description", "body"):
+-        if value := getattr(data, key):
+-
+-            if key == "title":
+-                update_str += "slug = :new_slug, "
+-                new_slug = generate_slug(value)
+-                params["new_slug"] = new_slug
+-
+-            update_str += f"{key} = :{key}, "
+-            params[key] = value
+-
+-    db_conn.execute(
+-        satext(
+-            f"""
+-            UPDATE articles
+-            SET {update_str}
+-                updated_date = CURRENT_TIMESTAMP
+-            WHERE slug = :slug
+-            AND author_user_id = :curr_user_id
+-            """
+-        ).bindparams(
+-            slug=curr_slug,
+-            curr_user_id=curr_user_id,
+-            **params,
+-        )
+-    )
+-
+-    slug = new_slug if new_slug else curr_slug
+-    return get_article_by_slug(db_conn, slug, curr_user_id)
+-
+-
+-def delete_article(db_conn: Connection, slug: str, curr_user_id: str) -> bool:
+-    result = db_conn.execute(
+-        satext(
+-            """
+-            DELETE FROM articles
+-            WHERE slug = :slug
+-            AND author_user_id = :curr_user_id
+-            """
+-        ).bindparams(slug=slug, curr_user_id=curr_user_id)
+-    )
+-    return bool(result.rowcount)
+-
+-
+-def create_article_comment(
+-    db_conn: Connection, slug: str, curr_user_id: str, data: CreateCommentData
+-) -> typ.Tuple[bool, Comment]:
+-    result = db_conn.execute(
+-        satext(
+-            """
+-            INSERT INTO article_comments (article_id, commenter_user_id, body)
+-            VALUES (
+-                (SELECT id FROM articles WHERE slug = :slug),
+-                :curr_user_id,
+-                :body
+-            )
+-            RETURNING id, created_date, body
+-            """
+-        ).bindparams(slug=slug, curr_user_id=curr_user_id, body=data.body)
+-    ).fetchone()
+-
+-    if not result:
+-        return False, None
+-
+-    return True, Comment(
+-        id=str(result.id),
+-        created_at=result.created_date,
+-        updated_at=result.created_date,
+-        body=result.body,
+-        author=_get_curr_profile_by_id(db_conn, curr_user_id),
+-    )
+-
+-
+-def get_article_comments(
+-    db_conn: Connection, slug: str, curr_user_id: typ.Optional[str]
+-) -> typ.List[Comment]:
+-    result = db_conn.execute(
+-        satext(
+-            """
+-            SELECT
+-                ac.id,
+-                ac.body,
+-                ac.created_date,
+-                ac.updated_date,
+-                u.username,
+-                u.bio,
+-                u.image_url,
+-                (
+-                    SELECT COUNT(*)
+-                    FROM user_follows uf
+-                    WHERE uf.user_id = :curr_user_id
+-                    AND uf.following_user_id = u.id
+-                ) > 0 AS is_following
+-            FROM article_comments ac
+-            JOIN users u ON ac.commenter_user_id = u.id
+-            JOIN articles a ON ac.article_id = a.id
+-            WHERE a.slug = :slug
+-            """
+-        ).bindparams(slug=slug, curr_user_id=curr_user_id)
+-    ).fetchall()
+-
+-    if not result:
+-        return []
+-
+-    comments = []
+-    for row in result:
+-        comments.append(
+-            Comment(
+-                id=str(row.id),
+-                body=row.body,
+-                created_at=row.created_date,
+-                updated_at=row.updated_date,
+-                author=Profile(
+-                    username=row.username,
+-                    bio=row.bio,
+-                    image=row.image_url,
+-                    following=bool(row.is_following),
+-                ),
+-            )
+-        )
+-
+-    return comments
+-
+-
+-def delete_article_comment(
+-    db_conn: Connection, slug: str, comment_id: int, curr_user_id: str
+-) -> bool:
+-    db_conn.execute(
+-        satext(
+-            """
+-            DELETE FROM article_comments
+-            WHERE id = :comment_id
+-            AND article_id = (SELECT id FROM articles WHERE slug = :slug)
+-            AND commenter_user_id = :curr_user_id
+-            """
+-        ).bindparams(slug=slug, comment_id=comment_id, curr_user_id=curr_user_id)
+-    )
+-    return True
+-
+-
+-def add_article_favorite(
+-    db_conn: Connection, slug: str, curr_user_id: str
+-) -> typ.Optional[Article]:
+-    db_conn.execute(
+-        satext(
+-            """
+-            INSERT INTO article_favorites (article_id, user_id)
+-            SELECT a.id, :user_id
+-            FROM articles a
+-            WHERE a.slug = :slug 
+-            ON CONFLICT DO NOTHING
+-            """
+-        ).bindparams(slug=slug, user_id=curr_user_id)
+-    )
+-    return get_article_by_slug(db_conn, slug, curr_user_id)
+-
+-
+-def delete_article_favorite(
+-    db_conn: Connection, slug: str, curr_user_id: str
+-) -> typ.Optional[Article]:
+-    db_conn.execute(
+-        satext(
+-            """
+-            DELETE FROM article_favorites
+-            WHERE article_id = (
+-                SELECT id
+-                FROM articles
+-                WHERE slug = :slug
+-            )
+-            AND user_id = :user_id
+-            """
+-        ).bindparams(slug=slug, user_id=curr_user_id)
+-    )
+-    return get_article_by_slug(db_conn, slug, curr_user_id)
+-
+-
+-def get_all_tags(db_conn: Connection) -> typ.List[str]:
+-    result = db_conn.execute(satext("SELECT * from tags")).fetchall()
+-    return [tag.name for tag in result]
+diff --git a/realworld/api/routes/v1/articles/models.py b/realworld/api/routes/v1/articles/models.py
+deleted file mode 100644
+index c5b1933..0000000
+--- a/realworld/api/routes/v1/articles/models.py
++++ /dev/null
+@@ -1,63 +0,0 @@
+-import typing as typ
+-from realworld.api.core.models import BaseCamelModel, Article, Comment
+-
+-
+-# GET /api/articles
+-# GET /api/articles/feed
+-
+-
+-# POST /api/articles
+-class CreateArticleData(BaseCamelModel):
+-    title: str
+-    description: str
+-    body: str
+-    tag_list: typ.Optional[typ.List[str]] = None
+-
+-
+-class CreateArticleRequest(BaseCamelModel):
+-    article: CreateArticleData
+-
+-
+-# PUT /api/articles/:slug
+-class UpdateArticleData(BaseCamelModel):
+-    title: typ.Optional[str] = None
+-    description: typ.Optional[str] = None
+-    body: typ.Optional[str] = None
+-
+-
+-class UpdateArticleRequest(BaseCamelModel):
+-    article: UpdateArticleData
+-
+-
+-# POST /api/articles/:slug/comments
+-class CreateCommentData(BaseCamelModel):
+-    body: str
+-
+-
+-class CreateCommentRequest(BaseCamelModel):
+-    comment: CreateCommentData
+-
+-
+-class CreateCommentResponse(BaseCamelModel):
+-    comment: Comment
+-
+-
+-#
+-# Shared Response Models
+-#
+-class SingleArticleResponse(BaseCamelModel):
+-    article: Article
+-
+-
+-class MultipleArticlesResponse(BaseCamelModel):
+-    articles: typ.List[Article]
+-    articles_count: int
+-
+-
+-class MultipleCommentsResponse(BaseCamelModel):
+-    comments: typ.List[Comment]
+-
+-
+-# GET /api/tags
+-class GetTagsResponse(BaseCamelModel):
+-    tags: list[str]
+diff --git a/realworld/api/routes/v1/articles/routes.py b/realworld/api/routes/v1/articles/routes.py
+deleted file mode 100644
+index 9cbfeb6..0000000
+--- a/realworld/api/routes/v1/articles/routes.py
++++ /dev/null
+@@ -1,199 +0,0 @@
+-from flask import Blueprint, request
+-from realworld.api.core.db import get_db_connection
+-import realworld.api.routes.v1.articles.handler as articles_handler
+-from realworld.api.core.auth import validate_token, get_user_id_from_token
+-from realworld.api.routes.v1.articles.models import (
+-    # GetArticlesQueryParams,
+-    # GetFeedQueryParams,
+-    GetTagsResponse,
+-    CreateArticleRequest,
+-    UpdateArticleRequest,
+-    CreateCommentRequest,
+-    CreateCommentResponse,
+-    SingleArticleResponse,
+-    MultipleArticlesResponse,
+-    MultipleCommentsResponse,
+-)
+-
+-
+-articles_blueprint = Blueprint("articles_endpoints", __name__)
+-tags_blueprint = Blueprint("tags_endpoints", __name__, url_prefix="/tags")
+-
+-
+-@articles_blueprint.route("/articles", methods=["GET"])
+-def get_articles() -> dict:
+-    """
+-    Returns most recent articles globally by default, provide tag, author or favorited query parameter to filter results
+-    """
+-    user_id = get_user_id_from_token()
+-    with get_db_connection() as db_conn:
+-        articles = articles_handler.get_articles(
+-            db_conn,
+-            curr_user_id=user_id,
+-            filter_tag=request.args.get("tag"),
+-            author_username_filter=request.args.get("author"),
+-            favorited_by_username_filter=request.args.get("favorited"),
+-            limit=int(request.args.get("limit", 20)),
+-            offset=int(request.args.get("offset", 0)),
+-        )
+-
+-    return MultipleArticlesResponse(
+-        articles=articles,
+-        articles_count=len(articles),
+-    ).model_dump()
+-
+-
+-@validate_token
+-@articles_blueprint.route("/articles/feed", methods=["GET"])
+-def get_feed() -> dict:
+-    """
+-    Returns articles created by followed users, ordered by most recent first.
+-    """
+-    if not (user_id := get_user_id_from_token()):
+-        return {"message": "Invalid token"}, 401
+-
+-    with get_db_connection() as db_conn:
+-        articles = articles_handler.get_feed_articles(
+-            db_conn,
+-            user_id,
+-            limit=int(request.args.get("limit", 20)),
+-            offset=int(request.args.get("offset", 0)),
+-        )
+-
+-    return MultipleArticlesResponse(
+-        articles=articles,
+-        articles_count=len(articles),
+-    ).model_dump()
+-
+-
+-@articles_blueprint.route("/articles/<string:slug>", methods=["GET"])
+-def get_article(slug: str) -> dict:
+-    with get_db_connection() as db_conn:
+-        article = articles_handler.get_article_by_slug(
+-            db_conn, slug, curr_user_id=get_user_id_from_token()
+-        )
+-        if not article:
+-            return {"message": "Article not found"}, 404
+-
+-    return SingleArticleResponse(article=article).model_dump()
+-
+-
+-@articles_blueprint.route("/articles", methods=["POST"])
+-def create_article() -> dict:
+-    if not (user_id := get_user_id_from_token()):
+-        return {"message": "Invalid token"}, 401
+-
+-    data = CreateArticleRequest.model_validate(request.json)
+-    with get_db_connection() as db_conn:
+-        article = articles_handler.create_article(db_conn, user_id, data.article)
+-
+-    return SingleArticleResponse(article=article).model_dump()
+-
+-
+-@articles_blueprint.route("/articles/<string:slug>", methods=["PUT"])
+-def update_article(slug) -> dict:
+-    if not (user_id := get_user_id_from_token()):
+-        return {"message": "Invalid token"}, 401
+-
+-    data = UpdateArticleRequest.model_validate(request.json)
+-    with get_db_connection() as db_conn:
+-        article = articles_handler.update_article(db_conn, slug, user_id, data.article)
+-        if not article:
+-            return {"message": "Article not found"}, 404
+-
+-    return SingleArticleResponse(article=article).model_dump()
+-
+-
+-@articles_blueprint.route("/articles/<string:slug>", methods=["DELETE"])
+-def delete_article(slug: str) -> dict:
+-    if not (user_id := get_user_id_from_token()):
+-        return {"message": "Invalid token"}, 401
+-
+-    with get_db_connection() as db_conn:
+-        if not articles_handler.delete_article(db_conn, slug, user_id):
+-            return {"message": "Article not found"}, 404
+-
+-    return {"message": "Article deleted"}
+-
+-
+-#
+-# Comments
+-#
+-@articles_blueprint.route("/articles/<string:slug>/comments", methods=["POST"])
+-def create_comment(slug: str) -> dict:
+-    if not (user_id := get_user_id_from_token()):
+-        return {"message": "Invalid token"}, 401
+-
+-    data = CreateCommentRequest.model_validate(request.json)
+-
+-    with get_db_connection() as db_conn:
+-        does_article_exist, comment = articles_handler.create_article_comment(
+-            db_conn, slug, user_id, data.comment
+-        )
+-        if not does_article_exist:
+-            return {"message": "Article not found"}, 404
+-
+-    return CreateCommentResponse(comment=comment).model_dump()
+-
+-
+-@articles_blueprint.route("/articles/<string:slug>/comments", methods=["GET"])
+-def get_comments(slug: str) -> dict:
+-    with get_db_connection() as db_conn:
+-        comments = articles_handler.get_article_comments(
+-            db_conn, slug, curr_user_id=get_user_id_from_token()
+-        )
+-
+-    return MultipleCommentsResponse(comments=comments).model_dump()
+-
+-
+-@articles_blueprint.route(
+-    "/articles/<string:slug>/comments/<string:comment_id>", methods=["DELETE"]
+-)
+-def delete_comment(slug: str, comment_id: str) -> dict:
+-    if not (user_id := get_user_id_from_token()):
+-        return {"message": "Invalid token"}, 401
+-
+-    with get_db_connection() as db_conn:
+-        articles_handler.delete_article_comment(db_conn, slug, comment_id, user_id)
+-
+-    return {"message": "Comment deleted"}
+-
+-
+-#
+-# Favorites
+-#
+-@articles_blueprint.route("/articles/<string:slug>/favorite", methods=["POST"])
+-def favorite_article(slug: str) -> dict:
+-    if not (user_id := get_user_id_from_token()):
+-        return {"message": "Invalid token"}, 401
+-
+-    with get_db_connection() as db_conn:
+-        article = articles_handler.add_article_favorite(db_conn, slug, user_id)
+-        if not article:
+-            return {"message": "Article not found"}, 404
+-
+-    return SingleArticleResponse(article=article).model_dump()
+-
+-
+-@articles_blueprint.route("/articles/<string:slug>/favorite", methods=["DELETE"])
+-def unfavorite_article(slug: str) -> dict:
+-    if not (user_id := get_user_id_from_token()):
+-        return {"message": "Invalid token"}, 401
+-
+-    with get_db_connection() as db_conn:
+-        article = articles_handler.delete_article_favorite(db_conn, slug, user_id)
+-        if not article:
+-            return {"message": "Article not found"}, 404
+-
+-    return SingleArticleResponse(article=article).model_dump()
+-
+-
+-#
+-# Tags
+-#
+-@tags_blueprint.route("", methods=["GET"])
+-def get_tags() -> dict:
+-    with get_db_connection() as db_conn:
+-        tags = articles_handler.get_all_tags(db_conn)
+-
+-    return GetTagsResponse(tags=tags).model_dump()
+diff --git a/realworld/app.py b/realworld/app.py
+index 46a6378..488e4dc 100644
+--- a/realworld/app.py
++++ b/realworld/app.py
+@@ -3,8 +3,6 @@ from flask_cors import CORS
+ from pydantic import ValidationError
+ from realworld.api.routes.v1.users.routes import users_blueprint
+ from realworld.api.routes.v1.profiles.routes import profiles_blueprint
+-from realworld.api.routes.v1.articles.routes import articles_blueprint, tags_blueprint
+-
+ 
+ def create_app() -> Flask:
+     app = Flask(__name__)
+@@ -15,14 +13,10 @@ def create_app() -> Flask:
+ 
+ 
+ def _register_blueprints(app: Flask):
+-    app.register_blueprint(articles_blueprint, url_prefix="/api")
+     app.register_blueprint(users_blueprint, url_prefix="/api")
+     app.register_blueprint(
+         profiles_blueprint, url_prefix=f"/api{profiles_blueprint.url_prefix}"
+     )
+-    app.register_blueprint(
+-        tags_blueprint, url_prefix=f"/api{tags_blueprint.url_prefix}"
+-    )
+ 
+     @app.route("/api/ping")
+     def ping():
+diff --git a/scripts/Conduit.postman_collection.json b/scripts/Conduit.postman_collection.json
+deleted file mode 100644
+index e4d3f88..0000000
+--- a/scripts/Conduit.postman_collection.json
++++ /dev/null
+@@ -1,2181 +0,0 @@
+-{
+-  "info": {
+-    "_postman_id": "0574ad8a-a525-43ae-8e1e-5fd9756037f4",
+-    "name": "Conduit",
+-    "description": "Collection for testing the Conduit API\n\nhttps://github.com/gothinkster/realworld",
+-    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+-  },
+-  "item": [
+-    {
+-      "name": "Auth",
+-      "item": [
+-        {
+-          "name": "Register",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "if (!(environment.isIntegrationTest)) {",
+-                  "var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "pm.test['Response contains \"user\" property'] = responseJSON.hasOwnProperty('user');",
+-                  "",
+-                  "var user = responseJSON.user || {};",
+-                  "",
+-                  "pm.test['User has \"email\" property'] = user.hasOwnProperty('email');",
+-                  "pm.test['User has \"username\" property'] = user.hasOwnProperty('username');",
+-                  "pm.test['User has \"bio\" property'] = user.hasOwnProperty('bio');",
+-                  "pm.test['User has \"image\" property'] = user.hasOwnProperty('image');",
+-                  "pm.test['User has \"token\" property'] = user.hasOwnProperty('token');",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "POST",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": "{\"user\":{\"email\":\"{{EMAIL}}\", \"password\":\"{{PASSWORD}}\", \"username\":\"{{USERNAME}}\"}}"
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/users",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "users"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Login",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "pm.test['Response contains \"user\" property'] = responseJSON.hasOwnProperty('user');",
+-                  "",
+-                  "var user = responseJSON.user || {};",
+-                  "",
+-                  "pm.test['User has \"email\" property'] = user.hasOwnProperty('email');",
+-                  "pm.test['User has \"username\" property'] = user.hasOwnProperty('username');",
+-                  "pm.test['User has \"bio\" property'] = user.hasOwnProperty('bio');",
+-                  "pm.test['User has \"image\" property'] = user.hasOwnProperty('image');",
+-                  "pm.test['User has \"token\" property'] = user.hasOwnProperty('token');",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "POST",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": "{\"user\":{\"email\":\"{{EMAIL}}\", \"password\":\"{{PASSWORD}}\"}}"
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/users/login",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "users",
+-                "login"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Login and Remember Token",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "id": "a7674032-bf09-4ae7-8224-4afa2fb1a9f9",
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "pm.test['Response contains \"user\" property'] = responseJSON.hasOwnProperty('user');",
+-                  "",
+-                  "var user = responseJSON.user || {};",
+-                  "",
+-                  "pm.test['User has \"email\" property'] = user.hasOwnProperty('email');",
+-                  "pm.test['User has \"username\" property'] = user.hasOwnProperty('username');",
+-                  "pm.test['User has \"bio\" property'] = user.hasOwnProperty('bio');",
+-                  "pm.test['User has \"image\" property'] = user.hasOwnProperty('image');",
+-                  "pm.test['User has \"token\" property'] = user.hasOwnProperty('token');",
+-                  "",
+-                  "if(pm.test['User has \"token\" property']){",
+-                  "    pm.globals.set('token', user.token);",
+-                  "}",
+-                  "",
+-                  "pm.test['Global variable \"token\" has been set'] = pm.globals.get('token') === user.token;",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "POST",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": "{\"user\":{\"email\":\"{{EMAIL}}\", \"password\":\"{{PASSWORD}}\"}}"
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/users/login",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "users",
+-                "login"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Current User",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "pm.test['Response contains \"user\" property'] = responseJSON.hasOwnProperty('user');",
+-                  "",
+-                  "var user = responseJSON.user || {};",
+-                  "",
+-                  "pm.test['User has \"email\" property'] = user.hasOwnProperty('email');",
+-                  "pm.test['User has \"username\" property'] = user.hasOwnProperty('username');",
+-                  "pm.test['User has \"bio\" property'] = user.hasOwnProperty('bio');",
+-                  "pm.test['User has \"image\" property'] = user.hasOwnProperty('image');",
+-                  "pm.test['User has \"token\" property'] = user.hasOwnProperty('token');",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/user",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "user"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Update User",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "pm.test['Response contains \"user\" property'] = responseJSON.hasOwnProperty('user');",
+-                  "",
+-                  "var user = responseJSON.user || {};",
+-                  "",
+-                  "pm.test['User has \"email\" property'] = user.hasOwnProperty('email');",
+-                  "pm.test['User has \"username\" property'] = user.hasOwnProperty('username');",
+-                  "pm.test['User has \"bio\" property'] = user.hasOwnProperty('bio');",
+-                  "pm.test['User has \"image\" property'] = user.hasOwnProperty('image');",
+-                  "pm.test['User has \"token\" property'] = user.hasOwnProperty('token');",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "PUT",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": "{\"user\":{\"email\":\"{{EMAIL}}\"}}"
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/user",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "user"
+-              ]
+-            }
+-          },
+-          "response": []
+-        }
+-      ]
+-    },
+-    {
+-      "name": "Articles",
+-      "item": [
+-        {
+-          "name": "All Articles",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "pm.test['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "    pm.test['Response contains \"articles\" property'] = responseJSON.hasOwnProperty('articles');",
+-                  "    pm.test['Response contains \"articlesCount\" property'] = responseJSON.hasOwnProperty('articlesCount');",
+-                  "    pm.test['articlesCount is an integer'] = Number.isInteger(responseJSON.articlesCount);",
+-                  "",
+-                  "    if(responseJSON.articles.length){",
+-                  "        var article = responseJSON.articles[0];",
+-                  "",
+-                  "        pm.test['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "        pm.test['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "        pm.test['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "        pm.test['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "        pm.test['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "        pm.test['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "        pm.test['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "        pm.test['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "        pm.test['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "        pm.test['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "        pm.test['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "        pm.test['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "        pm.test['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  "    } else {",
+-                  "        pm.test['articlesCount is 0 when feed is empty'] = responseJSON.articlesCount === 0;",
+-                  "    }",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Articles by Author",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "pm.test['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "    pm.test['Response contains \"articles\" property'] = responseJSON.hasOwnProperty('articles');",
+-                  "    pm.test['Response contains \"articlesCount\" property'] = responseJSON.hasOwnProperty('articlesCount');",
+-                  "    pm.test['articlesCount is an integer'] = Number.isInteger(responseJSON.articlesCount);",
+-                  "",
+-                  "    if(responseJSON.articles.length){",
+-                  "        var article = responseJSON.articles[0];",
+-                  "",
+-                  "        pm.test['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "        pm.test['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "        pm.test['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "        pm.test['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "        pm.test['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "        pm.test['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "        pm.test['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "        pm.test['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "        pm.test['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "        pm.test['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "        pm.test['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "        pm.test['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "        pm.test['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  "    } else {",
+-                  "        pm.test['articlesCount is 0 when feed is empty'] = responseJSON.articlesCount === 0;",
+-                  "    }",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles?author=johnjacob",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles"
+-              ],
+-              "query": [
+-                {
+-                  "key": "author",
+-                  "value": "johnjacob"
+-                }
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Articles Favorited by Username",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "pm.test['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "    ",
+-                  "    pm.test['Response contains \"articles\" property'] = responseJSON.hasOwnProperty('articles');",
+-                  "    pm.test['Response contains \"articlesCount\" property'] = responseJSON.hasOwnProperty('articlesCount');",
+-                  "    pm.test['articlesCount is an integer'] = Number.isInteger(responseJSON.articlesCount);",
+-                  "",
+-                  "    if(responseJSON.articles.length){",
+-                  "        var article = responseJSON.articles[0];",
+-                  "",
+-                  "        pm.test['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "        pm.test['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "        pm.test['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "        pm.test['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "        pm.test['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "        pm.test['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "        pm.test['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "        pm.test['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "        pm.test['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "        pm.test['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "        pm.test['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "        pm.test['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "        pm.test['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  "    } else {",
+-                  "        pm.test['articlesCount is 0 when feed is empty'] = responseJSON.articlesCount === 0;",
+-                  "    }",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles?favorited={{USERNAME}}",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles"
+-              ],
+-              "query": [
+-                {
+-                  "key": "favorited",
+-                  "value": "{{USERNAME}}"
+-                }
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Articles by Tag",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "pm.test['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "    pm.test['Response contains \"articles\" property'] = responseJSON.hasOwnProperty('articles');",
+-                  "    pm.test['Response contains \"articlesCount\" property'] = responseJSON.hasOwnProperty('articlesCount');",
+-                  "    pm.test['articlesCount is an integer'] = Number.isInteger(responseJSON.articlesCount);",
+-                  "",
+-                  "    if(responseJSON.articles.length){",
+-                  "        var article = responseJSON.articles[0];",
+-                  "",
+-                  "        pm.test['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "        pm.test['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "        pm.test['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "        pm.test['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "        pm.test['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "        pm.test['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "        pm.test['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "        pm.test['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "        pm.test['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "        pm.test['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "        pm.test['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "        pm.test['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "        pm.test['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  "    } else {",
+-                  "        pm.test['articlesCount is 0 when feed is empty'] = responseJSON.articlesCount === 0;",
+-                  "    }",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles?tag=dragons",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles"
+-              ],
+-              "query": [
+-                {
+-                  "key": "tag",
+-                  "value": "dragons"
+-                }
+-              ]
+-            }
+-          },
+-          "response": []
+-        }
+-      ]
+-    },
+-    {
+-      "name": "Articles, Favorite, Comments",
+-      "item": [
+-        {
+-          "name": "Create Article",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "id": "e711dbf8-8065-4ba8-8b74-f1639a7d8208",
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "pm.test['Response contains \"article\" property'] = responseJSON.hasOwnProperty('article');",
+-                  "",
+-                  "var article = responseJSON.article || {};",
+-                  "",
+-                  "pm.test['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "",
+-                  "pm.test['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "",
+-                  "if(pm.test['Article has \"slug\" property']){",
+-                  "    pm.globals.set('slug', article.slug);",
+-                  "}",
+-                  "",
+-                  "pm.test['Global variable \"slug\" has been set'] = pm.globals.get('slug') === article.slug;",
+-                  "",
+-                  "pm.test['Article has \"body\" property'] = article.hasOwnProperty('body');",
+-                  "pm.test['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "pm.test['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "pm.test['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "pm.test['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "pm.test['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "pm.test['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "pm.test['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "pm.test['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "pm.test['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "pm.test['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "pm.test['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "POST",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": "{\"article\":{\"title\":\"How to train your dragon\", \"description\":\"Ever wonder how?\", \"body\":\"Very carefully.\", \"tagList\":[\"training\", \"dragons\"]}}"
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Feed",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "pm.test['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "    pm.test['Response contains \"articles\" property'] = responseJSON.hasOwnProperty('articles');",
+-                  "    pm.test['Response contains \"articlesCount\" property'] = responseJSON.hasOwnProperty('articlesCount');",
+-                  "    pm.test['articlesCount is an integer'] = Number.isInteger(responseJSON.articlesCount);",
+-                  "",
+-                  "    if(responseJSON.articles.length){",
+-                  "        var article = responseJSON.articles[0];",
+-                  "",
+-                  "        pm.test['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "        pm.test['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "        pm.test['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "        pm.test['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "        pm.test['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "        pm.test['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "        pm.test['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "        pm.test['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "        pm.test['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "        pm.test['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "        pm.test['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "        pm.test['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "        pm.test['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  "    } else {",
+-                  "        pm.test['articlesCount is 0 when feed is empty'] = responseJSON.articlesCount === 0;",
+-                  "    }",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles/feed",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles",
+-                "feed"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "All Articles",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "pm.test['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "    pm.test['Response contains \"articles\" property'] = responseJSON.hasOwnProperty('articles');",
+-                  "    pm.test['Response contains \"articlesCount\" property'] = responseJSON.hasOwnProperty('articlesCount');",
+-                  "    pm.test['articlesCount is an integer'] = Number.isInteger(responseJSON.articlesCount);",
+-                  "",
+-                  "    if(responseJSON.articles.length){",
+-                  "        var article = responseJSON.articles[0];",
+-                  "",
+-                  "        pm.test['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "        pm.test['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "        pm.test['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "        pm.test['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "        pm.test['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "        pm.test['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "        pm.test['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "        pm.test['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "        pm.test['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "        pm.test['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "        pm.test['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "        pm.test['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "        pm.test['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  "    } else {",
+-                  "        pm.test['articlesCount is 0 when feed is empty'] = responseJSON.articlesCount === 0;",
+-                  "    }",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "All Articles with auth",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "pm.test['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "    pm.test['Response contains \"articles\" property'] = responseJSON.hasOwnProperty('articles');",
+-                  "    pm.test['Response contains \"articlesCount\" property'] = responseJSON.hasOwnProperty('articlesCount');",
+-                  "    pm.test['articlesCount is an integer'] = Number.isInteger(responseJSON.articlesCount);",
+-                  "",
+-                  "    if(responseJSON.articles.length){",
+-                  "        var article = responseJSON.articles[0];",
+-                  "",
+-                  "        pm.test['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "        pm.test['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "        pm.test['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "        pm.test['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "        pm.test['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "        pm.test['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "        pm.test['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "        pm.test['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "        pm.test['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "        pm.test['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "        pm.test['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "        pm.test['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "        pm.test['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  "    } else {",
+-                  "        pm.test['articlesCount is 0 when feed is empty'] = responseJSON.articlesCount === 0;",
+-                  "    }",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Articles by Author",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "pm.test['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "    pm.test['Response contains \"articles\" property'] = responseJSON.hasOwnProperty('articles');",
+-                  "    pm.test['Response contains \"articlesCount\" property'] = responseJSON.hasOwnProperty('articlesCount');",
+-                  "    pm.test['articlesCount is an integer'] = Number.isInteger(responseJSON.articlesCount);",
+-                  "",
+-                  "    if(responseJSON.articles.length){",
+-                  "        var article = responseJSON.articles[0];",
+-                  "",
+-                  "        pm.test['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "        pm.test['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "        pm.test['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "        pm.test['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "        pm.test['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "        pm.test['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "        pm.test['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "        pm.test['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "        pm.test['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "        pm.test['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "        pm.test['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "        pm.test['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "        pm.test['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  "    } else {",
+-                  "        pm.test['articlesCount is 0 when feed is empty'] = responseJSON.articlesCount === 0;",
+-                  "    }",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles?author={{USERNAME}}",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles"
+-              ],
+-              "query": [
+-                {
+-                  "key": "author",
+-                  "value": "{{USERNAME}}"
+-                }
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Articles by Author with auth",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "pm.test['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "    pm.test['Response contains \"articles\" property'] = responseJSON.hasOwnProperty('articles');",
+-                  "    pm.test['Response contains \"articlesCount\" property'] = responseJSON.hasOwnProperty('articlesCount');",
+-                  "    pm.test['articlesCount is an integer'] = Number.isInteger(responseJSON.articlesCount);",
+-                  "",
+-                  "    if(responseJSON.articles.length){",
+-                  "        var article = responseJSON.articles[0];",
+-                  "",
+-                  "        pm.test['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "        pm.test['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "        pm.test['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "        pm.test['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "        pm.test['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "        pm.test['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "        pm.test['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "        pm.test['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "        pm.test['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "        pm.test['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "        pm.test['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "        pm.test['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "        pm.test['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  "    } else {",
+-                  "        pm.test['articlesCount is 0 when feed is empty'] = responseJSON.articlesCount === 0;",
+-                  "    }",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles?author={{USERNAME}}",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles"
+-              ],
+-              "query": [
+-                {
+-                  "key": "author",
+-                  "value": "{{USERNAME}}"
+-                }
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Single Article by slug",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "pm.test['Response contains \"article\" property'] = responseJSON.hasOwnProperty('article');",
+-                  "",
+-                  "var article = responseJSON.article || {};",
+-                  "",
+-                  "pm.test['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "pm.test['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "pm.test['Article has \"body\" property'] = article.hasOwnProperty('body');",
+-                  "pm.test['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "pm.test['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "pm.test['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "pm.test['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "pm.test['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "pm.test['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "pm.test['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "pm.test['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "pm.test['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "pm.test['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "pm.test['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles/{{slug}}",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles",
+-                "{{slug}}"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Articles by Tag",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "pm.test['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "    pm.test['Response contains \"articles\" property'] = responseJSON.hasOwnProperty('articles');",
+-                  "    pm.test['Response contains \"articlesCount\" property'] = responseJSON.hasOwnProperty('articlesCount');",
+-                  "    pm.test['articlesCount is an integer'] = Number.isInteger(responseJSON.articlesCount);",
+-                  "    var article = responseJSON.articles[0];",
+-                  "    pm.test['An article was returned'] = article !== undefined;",
+-                  "    pm.test['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "    pm.test['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "    pm.test['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "    pm.test['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "    pm.test['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "    pm.test['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "    pm.test['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "    pm.test['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "    pm.test['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "    pm.test['The first tag is dragons'] = article.tagList[0] === 'dragons';",
+-                  "    pm.test['The second tag is training'] = article.tagList[1] === 'training';",
+-                  "    pm.test['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "    pm.test['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "    pm.test['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "    pm.test['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles?tag=dragons",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles"
+-              ],
+-              "query": [
+-                {
+-                  "key": "tag",
+-                  "value": "dragons"
+-                }
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Update Article",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "if (!(environment.isIntegrationTest)) {",
+-                  "var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "pm.test['Response contains \"article\" property'] = responseJSON.hasOwnProperty('article');",
+-                  "",
+-                  "var article = responseJSON.article || {};",
+-                  "",
+-                  "pm.test['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "pm.test['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "pm.test['Article has \"body\" property'] = article.hasOwnProperty('body');",
+-                  "pm.test['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "pm.test['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "pm.test['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "pm.test['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "pm.test['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "pm.test['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "pm.test['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "pm.test['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "pm.test['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "pm.test['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "pm.test['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "PUT",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": "{\"article\":{\"body\":\"With two hands\"}}"
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles/{{slug}}",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles",
+-                "{{slug}}"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Favorite Article",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "pm.test['Response contains \"article\" property'] = responseJSON.hasOwnProperty('article');",
+-                  "",
+-                  "var article = responseJSON.article || {};",
+-                  "",
+-                  "pm.test['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "pm.test['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "pm.test['Article has \"body\" property'] = article.hasOwnProperty('body');",
+-                  "pm.test['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "pm.test['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "pm.test['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "pm.test['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "pm.test['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "pm.test['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "pm.test['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "pm.test['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "pm.test['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "pm.test[\"Article's 'favorited' property is true\"] = article.favorited === true;",
+-                  "pm.test['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "pm.test['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  "pm.test[\"Article's 'favoritesCount' property is greater than 0\"] = article.favoritesCount > 0;",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "POST",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles/{{slug}}/favorite",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles",
+-                "{{slug}}",
+-                "favorite"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Articles Favorited by Username",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "pm.test['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "    article = responseJSON.articles[0];",
+-                  "    pm.test['Response contains \"articles\" property'] = responseJSON.hasOwnProperty('articles');",
+-                  "    pm.test['Response contains \"articlesCount\" property'] = responseJSON.hasOwnProperty('articlesCount');",
+-                  "    pm.test['articlesCount is an integer'] = Number.isInteger(responseJSON.articlesCount);",
+-                  "    pm.test['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "    pm.test['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "    pm.test['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "    pm.test['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "    pm.test['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "    pm.test['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "    pm.test['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "    pm.test['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "    pm.test['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "    pm.test['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "    pm.test['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "    pm.test['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "    pm.test['favoritesCount is 1'] = article.favoritesCount === 1;",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles?favorited={{USERNAME}}",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles"
+-              ],
+-              "query": [
+-                {
+-                  "key": "favorited",
+-                  "value": "{{USERNAME}}"
+-                }
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Articles Favorited by Username with auth",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "pm.test['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "    article = responseJSON.articles[0];",
+-                  "    pm.test['Response contains \"articles\" property'] = responseJSON.hasOwnProperty('articles');",
+-                  "    pm.test['Response contains \"articlesCount\" property'] = responseJSON.hasOwnProperty('articlesCount');",
+-                  "    pm.test['articlesCount is an integer'] = Number.isInteger(responseJSON.articlesCount);",
+-                  "    pm.test['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "    pm.test['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "    pm.test['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "    pm.test['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "    pm.test['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "    pm.test['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "    pm.test['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "    pm.test['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "    pm.test['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "    pm.test['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "    pm.test['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "    pm.test['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "    pm.test['favoritesCount is 1'] = article.favoritesCount === 1;",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles?favorited={{USERNAME}}",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles"
+-              ],
+-              "query": [
+-                {
+-                  "key": "favorited",
+-                  "value": "{{USERNAME}}"
+-                }
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Unfavorite Article",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "pm.test['Response contains \"article\" property'] = responseJSON.hasOwnProperty('article');",
+-                  "",
+-                  "var article = responseJSON.article || {};",
+-                  "",
+-                  "pm.test['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "pm.test['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "pm.test['Article has \"body\" property'] = article.hasOwnProperty('body');",
+-                  "pm.test['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "pm.test['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "pm.test['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "pm.test['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "pm.test['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "pm.test['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "pm.test['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "pm.test['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "pm.test['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "pm.test['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "pm.test['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  "pm.test[\"Article's \\\"favorited\\\" property is false\"] = article.favorited === false;",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "DELETE",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles/{{slug}}/favorite",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles",
+-                "{{slug}}",
+-                "favorite"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Create Comment for Article",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "id": "9f90c364-cc68-4728-961a-85eb00197d7b",
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "pm.test['Response contains \"comment\" property'] = responseJSON.hasOwnProperty('comment');",
+-                  "",
+-                  "var comment = responseJSON.comment || {};",
+-                  "",
+-                  "pm.test['Comment has \"id\" property'] = comment.hasOwnProperty('id');",
+-                  "",
+-                  "if(pm.test['Comment has \"id\" property']){",
+-                  "    pm.globals.set('commentId', comment.id);",
+-                  "}",
+-                  "",
+-                  "pm.test['Global variable \"commentId\" has been set'] = pm.globals.get('commentId') === comment.id;",
+-                  "",
+-                  "pm.test['Comment has \"body\" property'] = comment.hasOwnProperty('body');",
+-                  "pm.test['Comment has \"createdAt\" property'] = comment.hasOwnProperty('createdAt');",
+-                  "pm.test['\"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(comment.createdAt);",
+-                  "pm.test['Comment has \"updatedAt\" property'] = comment.hasOwnProperty('updatedAt');",
+-                  "pm.test['\"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(comment.updatedAt);",
+-                  "pm.test['Comment has \"author\" property'] = comment.hasOwnProperty('author');",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "POST",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": "{\"comment\":{\"body\":\"Thank you so much!\"}}"
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles/{{slug}}/comments",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles",
+-                "{{slug}}",
+-                "comments"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "All Comments for Article",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200",
+-                  "",
+-                  "pm.test['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "    pm.test['Response contains \"comments\" property'] = responseJSON.hasOwnProperty('comments');",
+-                  "",
+-                  "    if(responseJSON.comments.length){",
+-                  "        var comment = responseJSON.comments[0];",
+-                  "",
+-                  "        pm.test['Comment has \"id\" property'] = comment.hasOwnProperty('id');",
+-                  "        pm.test['Comment has \"body\" property'] = comment.hasOwnProperty('body');",
+-                  "        pm.test['Comment has \"createdAt\" property'] = comment.hasOwnProperty('createdAt');",
+-                  "        pm.test['\"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(comment.createdAt);",
+-                  "        pm.test['Comment has \"updatedAt\" property'] = comment.hasOwnProperty('updatedAt');",
+-                  "        pm.test['\"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(comment.updatedAt);",
+-                  "        pm.test['Comment has \"author\" property'] = comment.hasOwnProperty('author');",
+-                  "    }",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles/{{slug}}/comments",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles",
+-                "{{slug}}",
+-                "comments"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "All Comments for Article without login",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200",
+-                  "",
+-                  "pm.test['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "    pm.test['Response contains \"comments\" property'] = responseJSON.hasOwnProperty('comments');",
+-                  "",
+-                  "    if(responseJSON.comments.length){",
+-                  "        var comment = responseJSON.comments[0];",
+-                  "",
+-                  "        pm.test['Comment has \"id\" property'] = comment.hasOwnProperty('id');",
+-                  "        pm.test['Comment has \"body\" property'] = comment.hasOwnProperty('body');",
+-                  "        pm.test['Comment has \"createdAt\" property'] = comment.hasOwnProperty('createdAt');",
+-                  "        pm.test['\"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(comment.createdAt);",
+-                  "        pm.test['Comment has \"updatedAt\" property'] = comment.hasOwnProperty('updatedAt');",
+-                  "        pm.test['\"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(comment.updatedAt);",
+-                  "        pm.test['Comment has \"author\" property'] = comment.hasOwnProperty('author');",
+-                  "    }",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles/{{slug}}/comments",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles",
+-                "{{slug}}",
+-                "comments"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Delete Comment for Article",
+-          "request": {
+-            "method": "DELETE",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles/{{slug}}/comments/{{commentId}}",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles",
+-                "{{slug}}",
+-                "comments",
+-                "{{commentId}}"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Delete Article",
+-          "request": {
+-            "method": "DELETE",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles/{{slug}}",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles",
+-                "{{slug}}"
+-              ]
+-            }
+-          },
+-          "response": []
+-        }
+-      ],
+-      "event": [
+-        {
+-          "listen": "prerequest",
+-          "script": {
+-            "id": "67853a4a-e972-4573-a295-dad12a46a9d7",
+-            "type": "text/javascript",
+-            "exec": [
+-              ""
+-            ]
+-          }
+-        },
+-        {
+-          "listen": "test",
+-          "script": {
+-            "id": "3057f989-15e4-484e-b8fa-a041043d0ac0",
+-            "type": "text/javascript",
+-            "exec": [
+-              ""
+-            ]
+-          }
+-        }
+-      ]
+-    },
+-    {
+-      "name": "Profiles",
+-      "item": [
+-        {
+-          "name": "Register Celeb",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "if (!(environment.isIntegrationTest)) {",
+-                  "var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "pm.test['Response contains \"user\" property'] = responseJSON.hasOwnProperty('user');",
+-                  "",
+-                  "var user = responseJSON.user || {};",
+-                  "",
+-                  "pm.test['User has \"email\" property'] = user.hasOwnProperty('email');",
+-                  "pm.test['User has \"username\" property'] = user.hasOwnProperty('username');",
+-                  "pm.test['User has \"bio\" property'] = user.hasOwnProperty('bio');",
+-                  "pm.test['User has \"image\" property'] = user.hasOwnProperty('image');",
+-                  "pm.test['User has \"token\" property'] = user.hasOwnProperty('token');",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "POST",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": "{\"user\":{\"email\":\"celeb_{{EMAIL}}\", \"password\":\"{{PASSWORD}}\", \"username\":\"celeb_{{USERNAME}}\"}}"
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/users",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "users"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Profile",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "if (!(environment.isIntegrationTest)) {",
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "pm.test['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "    pm.test['Response contains \"profile\" property'] = responseJSON.hasOwnProperty('profile');",
+-                  "    ",
+-                  "    var profile = responseJSON.profile || {};",
+-                  "    ",
+-                  "    pm.test['Profile has \"username\" property'] = profile.hasOwnProperty('username');",
+-                  "    pm.test['Profile has \"bio\" property'] = profile.hasOwnProperty('bio');",
+-                  "    pm.test['Profile has \"image\" property'] = profile.hasOwnProperty('image');",
+-                  "    pm.test['Profile has \"following\" property'] = profile.hasOwnProperty('following');",
+-                  "}",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/profiles/celeb_{{USERNAME}}",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "profiles",
+-                "celeb_{{USERNAME}}"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Follow Profile",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "if (!(environment.isIntegrationTest)) {",
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "pm.test['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "    pm.test['Response contains \"profile\" property'] = responseJSON.hasOwnProperty('profile');",
+-                  "    ",
+-                  "    var profile = responseJSON.profile || {};",
+-                  "    ",
+-                  "    pm.test['Profile has \"username\" property'] = profile.hasOwnProperty('username');",
+-                  "    pm.test['Profile has \"bio\" property'] = profile.hasOwnProperty('bio');",
+-                  "    pm.test['Profile has \"image\" property'] = profile.hasOwnProperty('image');",
+-                  "    pm.test['Profile has \"following\" property'] = profile.hasOwnProperty('following');",
+-                  "    pm.test['Profile\\'s \"following\" property is true'] = profile.following === true;",
+-                  "}",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "POST",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": "{\"user\":{\"email\":\"{{EMAIL}}\"}}"
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/profiles/celeb_{{USERNAME}}/follow",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "profiles",
+-                "celeb_{{USERNAME}}",
+-                "follow"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Unfollow Profile",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "if (!(environment.isIntegrationTest)) {",
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "pm.test['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "    pm.test['Response contains \"profile\" property'] = responseJSON.hasOwnProperty('profile');",
+-                  "    ",
+-                  "    var profile = responseJSON.profile || {};",
+-                  "    ",
+-                  "    pm.test['Profile has \"username\" property'] = profile.hasOwnProperty('username');",
+-                  "    pm.test['Profile has \"bio\" property'] = profile.hasOwnProperty('bio');",
+-                  "    pm.test['Profile has \"image\" property'] = profile.hasOwnProperty('image');",
+-                  "    pm.test['Profile has \"following\" property'] = profile.hasOwnProperty('following');",
+-                  "    pm.test['Profile\\'s \"following\" property is false'] = profile.following === false;",
+-                  "}",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "DELETE",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/profiles/celeb_{{USERNAME}}/follow",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "profiles",
+-                "celeb_{{USERNAME}}",
+-                "follow"
+-              ]
+-            }
+-          },
+-          "response": []
+-        }
+-      ]
+-    },
+-    {
+-      "name": "Tags",
+-      "item": [
+-        {
+-          "name": "All Tags",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "pm.test['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "    ",
+-                  "    pm.test['Response contains \"tags\" property'] = responseJSON.hasOwnProperty('tags');",
+-                  "    pm.test['\"tags\" property returned as array'] = Array.isArray(responseJSON.tags);",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/tags",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "tags"
+-              ]
+-            }
+-          },
+-          "response": []
+-        }
+-      ]
+-    }
+-  ]
+-}
+\ No newline at end of file
+diff --git a/scripts/openapi.yml b/scripts/openapi.yml
+deleted file mode 100644
+index 2a82aa4..0000000
+--- a/scripts/openapi.yml
++++ /dev/null
+@@ -1,836 +0,0 @@
+-openapi: 3.0.1
+-info:
+-  title: RealWorld Conduit API
+-  description: Conduit API documentation
+-  contact:
+-    name: RealWorld
+-    url: https://www.realworld.how
+-  license:
+-    name: MIT License
+-    url: https://opensource.org/licenses/MIT
+-  version: 1.0.0
+-tags:
+-  - name: Articles
+-  - name: Comments
+-  - name: Favorites
+-  - name: Profile
+-  - name: Tags
+-  - name: User and Authentication
+-servers:
+-  - url: https://api.realworld.io/api
+-paths:
+-  /users/login:
+-    post:
+-      tags:
+-        - User and Authentication
+-      summary: Existing user login
+-      description: Login for existing user
+-      operationId: Login
+-      requestBody:
+-        $ref: '#/components/requestBodies/LoginUserRequest'
+-      responses:
+-        '200':
+-          $ref: '#/components/responses/UserResponse'
+-        '401':
+-          $ref: '#/components/responses/Unauthorized'
+-        '422':
+-          $ref: '#/components/responses/GenericError'
+-      x-codegen-request-body-name: body
+-  /users:
+-    post:
+-      tags:
+-        - User and Authentication
+-      description: Register a new user
+-      operationId: CreateUser
+-      requestBody:
+-        $ref: '#/components/requestBodies/NewUserRequest'
+-      responses:
+-        '201':
+-          $ref: '#/components/responses/UserResponse'
+-        '422':
+-          $ref: '#/components/responses/GenericError'
+-      x-codegen-request-body-name: body
+-  /user:
+-    get:
+-      tags:
+-        - User and Authentication
+-      summary: Get current user
+-      description: Gets the currently logged-in user
+-      operationId: GetCurrentUser
+-      responses:
+-        '200':
+-          $ref: '#/components/responses/UserResponse'
+-        '401':
+-          $ref: '#/components/responses/Unauthorized'
+-        '422':
+-          $ref: '#/components/responses/GenericError'
+-      security:
+-        - Token: [ ]
+-    put:
+-      tags:
+-        - User and Authentication
+-      summary: Update current user
+-      description: Updated user information for current user
+-      operationId: UpdateCurrentUser
+-      requestBody:
+-        $ref: '#/components/requestBodies/UpdateUserRequest'
+-      responses:
+-        '200':
+-          $ref: '#/components/responses/UserResponse'
+-        '401':
+-          $ref: '#/components/responses/Unauthorized'
+-        '422':
+-          $ref: '#/components/responses/GenericError'
+-      security:
+-        - Token: [ ]
+-      x-codegen-request-body-name: body
+-  /profiles/{username}:
+-    get:
+-      tags:
+-        - Profile
+-      summary: Get a profile
+-      description: Get a profile of a user of the system. Auth is optional
+-      operationId: GetProfileByUsername
+-      parameters:
+-        - name: username
+-          in: path
+-          description: Username of the profile to get
+-          required: true
+-          schema:
+-            type: string
+-      responses:
+-        '200':
+-          $ref: '#/components/responses/ProfileResponse'
+-        '401':
+-          $ref: '#/components/responses/Unauthorized'
+-        '422':
+-          $ref: '#/components/responses/GenericError'
+-  /profiles/{username}/follow:
+-    post:
+-      tags:
+-        - Profile
+-      summary: Follow a user
+-      description: Follow a user by username
+-      operationId: FollowUserByUsername
+-      parameters:
+-        - name: username
+-          in: path
+-          description: Username of the profile you want to follow
+-          required: true
+-          schema:
+-            type: string
+-      responses:
+-        '200':
+-          $ref: '#/components/responses/ProfileResponse'
+-        '401':
+-          $ref: '#/components/responses/Unauthorized'
+-        '422':
+-          $ref: '#/components/responses/GenericError'
+-      security:
+-        - Token: [ ]
+-    delete:
+-      tags:
+-        - Profile
+-      summary: Unfollow a user
+-      description: Unfollow a user by username
+-      operationId: UnfollowUserByUsername
+-      parameters:
+-        - name: username
+-          in: path
+-          description: Username of the profile you want to unfollow
+-          required: true
+-          schema:
+-            type: string
+-      responses:
+-        '200':
+-          $ref: '#/components/responses/ProfileResponse'
+-        '401':
+-          $ref: '#/components/responses/Unauthorized'
+-        '422':
+-          $ref: '#/components/responses/GenericError'
+-      security:
+-        - Token: [ ]
+-  /articles/feed:
+-    get:
+-      tags:
+-        - Articles
+-      summary: Get recent articles from users you follow
+-      description: Get most recent articles from users you follow. Use query parameters
+-        to limit. Auth is required
+-      operationId: GetArticlesFeed
+-      parameters:
+-        - $ref: '#/components/parameters/offsetParam'
+-        - $ref: '#/components/parameters/limitParam'
+-      responses:
+-        '200':
+-          $ref: '#/components/responses/MultipleArticlesResponse'
+-        '401':
+-          $ref: '#/components/responses/Unauthorized'
+-        '422':
+-          $ref: '#/components/responses/GenericError'
+-      security:
+-        - Token: [ ]
+-  /articles:
+-    get:
+-      tags:
+-        - Articles
+-      summary: Get recent articles globally
+-      description: Get most recent articles globally. Use query parameters to filter
+-        results. Auth is optional
+-      operationId: GetArticles
+-      parameters:
+-        - name: tag
+-          in: query
+-          description: Filter by tag
+-          schema:
+-            type: string
+-        - name: author
+-          in: query
+-          description: Filter by author (username)
+-          schema:
+-            type: string
+-        - name: favorited
+-          in: query
+-          description: Filter by favorites of a user (username)
+-          schema:
+-            type: string
+-        - $ref: '#/components/parameters/offsetParam'
+-        - $ref: '#/components/parameters/limitParam'
+-      responses:
+-        '200':
+-          $ref: '#/components/responses/MultipleArticlesResponse'
+-        '401':
+-          $ref: '#/components/responses/Unauthorized'
+-        '422':
+-          $ref: '#/components/responses/GenericError'
+-    post:
+-      tags:
+-        - Articles
+-      summary: Create an article
+-      description: Create an article. Auth is required
+-      operationId: CreateArticle
+-      requestBody:
+-        $ref: '#/components/requestBodies/NewArticleRequest'
+-      responses:
+-        '201':
+-          $ref: '#/components/responses/SingleArticleResponse'
+-        '401':
+-          $ref: '#/components/responses/Unauthorized'
+-        '422':
+-          $ref: '#/components/responses/GenericError'
+-      security:
+-        - Token: [ ]
+-      x-codegen-request-body-name: article
+-  /articles/{slug}:
+-    get:
+-      tags:
+-        - Articles
+-      summary: Get an article
+-      description: Get an article. Auth not required
+-      operationId: GetArticle
+-      parameters:
+-        - name: slug
+-          in: path
+-          description: Slug of the article to get
+-          required: true
+-          schema:
+-            type: string
+-      responses:
+-        '200':
+-          $ref: '#/components/responses/SingleArticleResponse'
+-        '422':
+-          $ref: '#/components/responses/GenericError'
+-    put:
+-      tags:
+-        - Articles
+-      summary: Update an article
+-      description: Update an article. Auth is required
+-      operationId: UpdateArticle
+-      parameters:
+-        - name: slug
+-          in: path
+-          description: Slug of the article to update
+-          required: true
+-          schema:
+-            type: string
+-      requestBody:
+-        $ref: '#/components/requestBodies/UpdateArticleRequest'
+-      responses:
+-        '200':
+-          $ref: '#/components/responses/SingleArticleResponse'
+-        '401':
+-          $ref: '#/components/responses/Unauthorized'
+-        '422':
+-          $ref: '#/components/responses/GenericError'
+-      security:
+-        - Token: [ ]
+-      x-codegen-request-body-name: article
+-    delete:
+-      tags:
+-        - Articles
+-      summary: Delete an article
+-      description: Delete an article. Auth is required
+-      operationId: DeleteArticle
+-      parameters:
+-        - name: slug
+-          in: path
+-          description: Slug of the article to delete
+-          required: true
+-          schema:
+-            type: string
+-      responses:
+-        '200':
+-          $ref: '#/components/responses/EmptyOkResponse'
+-        '401':
+-          $ref: '#/components/responses/Unauthorized'
+-        '422':
+-          $ref: '#/components/responses/GenericError'
+-      security:
+-        - Token: [ ]
+-  /articles/{slug}/comments:
+-    get:
+-      tags:
+-        - Comments
+-      summary: Get comments for an article
+-      description: Get the comments for an article. Auth is optional
+-      operationId: GetArticleComments
+-      parameters:
+-        - name: slug
+-          in: path
+-          description: Slug of the article that you want to get comments for
+-          required: true
+-          schema:
+-            type: string
+-      responses:
+-        '200':
+-          $ref: '#/components/responses/MultipleCommentsResponse'
+-        '401':
+-          $ref: '#/components/responses/Unauthorized'
+-        '422':
+-          $ref: '#/components/responses/GenericError'
+-    post:
+-      tags:
+-        - Comments
+-      summary: Create a comment for an article
+-      description: Create a comment for an article. Auth is required
+-      operationId: CreateArticleComment
+-      parameters:
+-        - name: slug
+-          in: path
+-          description: Slug of the article that you want to create a comment for
+-          required: true
+-          schema:
+-            type: string
+-      requestBody:
+-        $ref: '#/components/requestBodies/NewCommentRequest'
+-      responses:
+-        '200':
+-          $ref: '#/components/responses/SingleCommentResponse'
+-        '401':
+-          $ref: '#/components/responses/Unauthorized'
+-        '422':
+-          $ref: '#/components/responses/GenericError'
+-      security:
+-        - Token: [ ]
+-      x-codegen-request-body-name: comment
+-  /articles/{slug}/comments/{id}:
+-    delete:
+-      tags:
+-        - Comments
+-      summary: Delete a comment for an article
+-      description: Delete a comment for an article. Auth is required
+-      operationId: DeleteArticleComment
+-      parameters:
+-        - name: slug
+-          in: path
+-          description: Slug of the article that you want to delete a comment for
+-          required: true
+-          schema:
+-            type: string
+-        - name: id
+-          in: path
+-          description: ID of the comment you want to delete
+-          required: true
+-          schema:
+-            type: integer
+-      responses:
+-        '200':
+-          $ref: '#/components/responses/EmptyOkResponse'
+-        '401':
+-          $ref: '#/components/responses/Unauthorized'
+-        '422':
+-          $ref: '#/components/responses/GenericError'
+-      security:
+-        - Token: [ ]
+-  /articles/{slug}/favorite:
+-    post:
+-      tags:
+-        - Favorites
+-      summary: Favorite an article
+-      description: Favorite an article. Auth is required
+-      operationId: CreateArticleFavorite
+-      parameters:
+-        - name: slug
+-          in: path
+-          description: Slug of the article that you want to favorite
+-          required: true
+-          schema:
+-            type: string
+-      responses:
+-        '200':
+-          $ref: '#/components/responses/SingleArticleResponse'
+-        '401':
+-          $ref: '#/components/responses/Unauthorized'
+-        '422':
+-          $ref: '#/components/responses/GenericError'
+-      security:
+-        - Token: [ ]
+-    delete:
+-      tags:
+-        - Favorites
+-      summary: Unfavorite an article
+-      description: Unfavorite an article. Auth is required
+-      operationId: DeleteArticleFavorite
+-      parameters:
+-        - name: slug
+-          in: path
+-          description: Slug of the article that you want to unfavorite
+-          required: true
+-          schema:
+-            type: string
+-      responses:
+-        '200':
+-          $ref: '#/components/responses/SingleArticleResponse'
+-        '401':
+-          $ref: '#/components/responses/Unauthorized'
+-        '422':
+-          $ref: '#/components/responses/GenericError'
+-      security:
+-        - Token: [ ]
+-  /tags:
+-    get:
+-      tags:
+-        - Tags
+-      summary: Get tags
+-      description: Get tags. Auth not required
+-      operationId: GetTags
+-      responses:
+-        '200':
+-          $ref: '#/components/responses/TagsResponse'
+-        '422':
+-          $ref: '#/components/responses/GenericError'
+-components:
+-  schemas:
+-    LoginUser:
+-      required:
+-        - email
+-        - password
+-      type: object
+-      properties:
+-        email:
+-          type: string
+-        password:
+-          type: string
+-          format: password
+-    NewUser:
+-      required:
+-        - email
+-        - password
+-        - username
+-      type: object
+-      properties:
+-        username:
+-          type: string
+-        email:
+-          type: string
+-        password:
+-          type: string
+-          format: password
+-    User:
+-      required:
+-        - bio
+-        - email
+-        - image
+-        - token
+-        - username
+-      type: object
+-      properties:
+-        email:
+-          type: string
+-        token:
+-          type: string
+-        username:
+-          type: string
+-        bio:
+-          type: string
+-        image:
+-          type: string
+-    UpdateUser:
+-      type: object
+-      properties:
+-        email:
+-          type: string
+-        password:
+-          type: string
+-        username:
+-          type: string
+-        bio:
+-          type: string
+-        image:
+-          type: string
+-    Profile:
+-      required:
+-        - bio
+-        - following
+-        - image
+-        - username
+-      type: object
+-      properties:
+-        username:
+-          type: string
+-        bio:
+-          type: string
+-        image:
+-          type: string
+-        following:
+-          type: boolean
+-    Article:
+-      required:
+-        - author
+-        - body
+-        - createdAt
+-        - description
+-        - favorited
+-        - favoritesCount
+-        - slug
+-        - tagList
+-        - title
+-        - updatedAt
+-      type: object
+-      properties:
+-        slug:
+-          type: string
+-        title:
+-          type: string
+-        description:
+-          type: string
+-        body:
+-          type: string
+-        tagList:
+-          type: array
+-          items:
+-            type: string
+-        createdAt:
+-          type: string
+-          format: date-time
+-        updatedAt:
+-          type: string
+-          format: date-time
+-        favorited:
+-          type: boolean
+-        favoritesCount:
+-          type: integer
+-        author:
+-          $ref: '#/components/schemas/Profile'
+-    NewArticle:
+-      required:
+-        - body
+-        - description
+-        - title
+-      type: object
+-      properties:
+-        title:
+-          type: string
+-        description:
+-          type: string
+-        body:
+-          type: string
+-        tagList:
+-          type: array
+-          items:
+-            type: string
+-    UpdateArticle:
+-      type: object
+-      properties:
+-        title:
+-          type: string
+-        description:
+-          type: string
+-        body:
+-          type: string
+-    Comment:
+-      required:
+-        - author
+-        - body
+-        - createdAt
+-        - id
+-        - updatedAt
+-      type: object
+-      properties:
+-        id:
+-          type: integer
+-        createdAt:
+-          type: string
+-          format: date-time
+-        updatedAt:
+-          type: string
+-          format: date-time
+-        body:
+-          type: string
+-        author:
+-          $ref: '#/components/schemas/Profile'
+-    NewComment:
+-      required:
+-        - body
+-      type: object
+-      properties:
+-        body:
+-          type: string
+-    GenericErrorModel:
+-      required:
+-        - errors
+-      type: object
+-      properties:
+-        errors:
+-          required:
+-            - body
+-          type: object
+-          properties:
+-            body:
+-              type: array
+-              items:
+-                type: string
+-  responses:
+-    TagsResponse:
+-      description: Tags
+-      content:
+-        application/json:
+-          schema:
+-            required:
+-              - tags
+-            type: object
+-            properties:
+-              tags:
+-                type: array
+-                items:
+-                  type: string
+-    SingleCommentResponse:
+-      description: Single comment
+-      content:
+-        application/json:
+-          schema:
+-            required:
+-              - comment
+-            type: object
+-            properties:
+-              comment:
+-                $ref: '#/components/schemas/Comment'
+-    MultipleCommentsResponse:
+-      description: Multiple comments
+-      content:
+-        application/json:
+-          schema:
+-            required:
+-              - comments
+-            type: object
+-            properties:
+-              comments:
+-                type: array
+-                items:
+-                  $ref: '#/components/schemas/Comment'
+-    SingleArticleResponse:
+-      description: Single article
+-      content:
+-        application/json:
+-          schema:
+-            required:
+-              - article
+-            type: object
+-            properties:
+-              article:
+-                $ref: '#/components/schemas/Article'
+-    MultipleArticlesResponse:
+-      description: Multiple articles
+-      content:
+-        application/json:
+-          schema:
+-            required:
+-              - articles
+-              - articlesCount
+-            type: object
+-            properties:
+-              articles:
+-                type: array
+-                items:
+-                  required:
+-                    - author
+-                    - createdAt
+-                    - description
+-                    - favorited
+-                    - favoritesCount
+-                    - slug
+-                    - tagList
+-                    - title
+-                    - updatedAt
+-                  type: object
+-                  properties:
+-                    slug:
+-                      type: string
+-                    title:
+-                      type: string
+-                    description:
+-                      type: string
+-                    tagList:
+-                      type: array
+-                      items:
+-                        type: string
+-                    createdAt:
+-                      type: string
+-                      format: date-time
+-                    updatedAt:
+-                      type: string
+-                      format: date-time
+-                    favorited:
+-                      type: boolean
+-                    favoritesCount:
+-                      type: integer
+-                    author:
+-                      $ref: '#/components/schemas/Profile'
+-              articlesCount:
+-                type: integer
+-    ProfileResponse:
+-      description: Profile
+-      content:
+-        application/json:
+-          schema:
+-            required:
+-              - profile
+-            type: object
+-            properties:
+-              profile:
+-                $ref: '#/components/schemas/Profile'
+-    UserResponse:
+-      description: User
+-      content:
+-        application/json:
+-          schema:
+-            required:
+-              - user
+-            type: object
+-            properties:
+-              user:
+-                $ref: '#/components/schemas/User'
+-    EmptyOkResponse:
+-      description: No content
+-      content: { }
+-    Unauthorized:
+-      description: Unauthorized
+-      content: { }
+-    GenericError:
+-      description: Unexpected error
+-      content:
+-        application/json:
+-          schema:
+-            $ref: '#/components/schemas/GenericErrorModel'
+-  requestBodies:
+-    LoginUserRequest:
+-      required: true
+-      description: Credentials to use
+-      content:
+-        application/json:
+-          schema:
+-            required:
+-              - user
+-            type: object
+-            properties:
+-              user:
+-                $ref: '#/components/schemas/LoginUser'
+-    NewUserRequest:
+-      required: true
+-      description: Details of the new user to register
+-      content:
+-        application/json:
+-          schema:
+-            required:
+-              - user
+-            type: object
+-            properties:
+-              user:
+-                $ref: '#/components/schemas/NewUser'
+-    UpdateUserRequest:
+-      required: true
+-      description: User details to update. At least **one** field is required.
+-      content:
+-        application/json:
+-          schema:
+-            required:
+-              - user
+-            type: object
+-            properties:
+-              user:
+-                $ref: '#/components/schemas/UpdateUser'
+-    NewArticleRequest:
+-      required: true
+-      description: Article to create
+-      content:
+-        application/json:
+-          schema:
+-            required:
+-              - article
+-            type: object
+-            properties:
+-              article:
+-                $ref: '#/components/schemas/NewArticle'
+-    UpdateArticleRequest:
+-      required: true
+-      description: Article to update
+-      content:
+-        application/json:
+-          schema:
+-            required:
+-              - article
+-            type: object
+-            properties:
+-              article:
+-                $ref: '#/components/schemas/UpdateArticle'
+-    NewCommentRequest:
+-      required: true
+-      description: Comment you want to create
+-      content:
+-        application/json:
+-          schema:
+-            required:
+-              - comment
+-            type: object
+-            properties:
+-              comment:
+-                $ref: '#/components/schemas/NewComment'
+-  parameters:
+-    offsetParam:
+-      in: query
+-      name: offset
+-      required: false
+-      schema:
+-        type: integer
+-        minimum: 0
+-      description: The number of items to skip before starting to collect the result set.
+-    limitParam:
+-      in: query
+-      name: limit
+-      required: false
+-      schema:
+-        type: integer
+-        minimum: 1
+-        default: 20
+-      description: The numbers of items to return.
+-  securitySchemes:
+-    Token:
+-      type: apiKey
+-      description: "For accessing the protected API resources, you must have received\
+-        \ a a valid JWT token after registering or logging in. This JWT token must\
+-        \ then be used for all protected resources by passing it in via the 'Authorization'\
+-        \ header.\n\nA JWT token is generated by the API by either registering via\
+-        \ /users or logging in via /users/login.\n\nThe following format must be in\
+-        \ the 'Authorization' header :\n\n    Token xxxxxx.yyyyyyy.zzzzzz\n    \n"
+-      name: Authorization
+-      in: header
+diff --git a/scripts/run-api-tests.sh b/scripts/run-api-tests.sh
+deleted file mode 100755
+index c6fa5f0..0000000
+--- a/scripts/run-api-tests.sh
++++ /dev/null
+@@ -1,26 +0,0 @@
+-#!/usr/bin/env bash
+-
+-# Check if the server is running
+-if ! curl -s --head "$APIURL"/ping | grep "200 OK" > /dev/null; then
+-  echo "Error: No server running at $APIURL";
+-  echo "Please start the server in another terminal";
+-  exit 1
+-fi
+-
+-# Print all comands before executing
+-set -x
+-
+-SCRIPTDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null && pwd )"
+-
+-APIURL=${APIURL:-https://api.realworld.io/api}
+-USERNAME=${USERNAME:-u`date +%s`}
+-EMAIL=${EMAIL:-$USERNAME@mail.com}
+-PASSWORD=${PASSWORD:-password}
+-
+-npx newman run $SCRIPTDIR/Conduit.postman_collection.json \
+-  --delay-request 500 \
+-  --global-var "APIURL=$APIURL" \
+-  --global-var "USERNAME=$USERNAME" \
+-  --global-var "EMAIL=$EMAIL" \
+-  --global-var "PASSWORD=$PASSWORD" \
+-  "$@"
+diff --git a/scripts/truncate-local-tables.sh b/scripts/truncate-local-tables.sh
+deleted file mode 100644
+index a4d7db8..0000000
+--- a/scripts/truncate-local-tables.sh
++++ /dev/null
+@@ -1,20 +0,0 @@
+-#!/usr/bin/env bash
+-
+-DB_NAME="realworlddb"
+-DB_USER="testuser"
+-DB_PASSWORD="changeme"
+-DB_HOST="postgres"
+-
+-TABLES=(
+-    "article_comments"
+-    "articles_favorites"
+-    "articles_tags"
+-    "articles"
+-    "tags"
+-    "user_follows"
+-    "users"
+-)
+-
+-for TABLE in "${TABLES[@]}"; do
+-    PGPASSWORD=$DB_PASSWORD psql -h $DB_HOST -U $DB_USER -d $DB_NAME -c "TRUNCATE TABLE $TABLE RESTART IDENTITY CASCADE;"
+-done
+\ No newline at end of file
+diff --git a/tests/__init__.py b/tests/__init__.py
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/tests/api/test_articles.py b/tests/api/test_articles.py
+deleted file mode 100644
+index a52d491..0000000
+--- a/tests/api/test_articles.py
++++ /dev/null
+@@ -1,251 +0,0 @@
+-from realworld.api.core.auth import generate_jwt
+-
+-
+-#
+-# Article Tests
+-#
+-def test_get_articles(client, add_user, add_article):
+-    user = add_user()
+-    articles = [add_article(author_user_id=user["id"]) for _ in range(3)]
+-
+-    resp = client.get("/api/articles")
+-    assert resp.status_code == 200
+-    assert resp.json["articlesCount"] == len(articles)
+-    assert len(resp.json["articles"]) == len(articles)
+-
+-    # Ensure the articles are in most recent order
+-    for idx, article in enumerate(reversed(articles)):
+-        assert resp.json["articles"][idx] == {
+-            "slug": article["slug"],
+-            "title": article["title"],
+-            "description": article["description"],
+-            "body": article["body"],
+-            "tagList": article["tags"],
+-            "createdAt": article["created_date"],
+-            "updatedAt": article["updated_date"],
+-            "favorited": False,
+-            "favoritesCount": 0,
+-            "author": {
+-                "username": user["username"],
+-                "bio": user["bio"],
+-                "image": user["image"],
+-                "following": False,
+-            },
+-        }
+-
+-
+-def test_get_feed(client, add_user, add_article, add_user_follow):
+-    # setup
+-    user = add_user()
+-    folliwng_user, other_user = add_user(), add_user()
+-    add_user_follow(user_id=user["id"], following_user_id=folliwng_user["id"])
+-
+-    # should not appear in feed
+-    add_article(author_user_id=user["id"])
+-    add_article(author_user_id=other_user["id"])
+-
+-    # should appear in feed
+-    expected = [add_article(author_user_id=folliwng_user["id"]) for _ in range(3)]
+-
+-    resp = client.get(
+-        "/api/articles/feed",
+-        headers={"Authorization": f"Token {generate_jwt(user['id'])}"},
+-    )
+-    assert resp.status_code == 200
+-    assert resp.json["articlesCount"] == len(expected)
+-    assert len(resp.json["articles"]) == len(expected)
+-
+-    # Ensure the articles are in most recent order
+-    for idx, article in enumerate(reversed(expected)):
+-        assert resp.json["articles"][idx] == {
+-            "slug": article["slug"],
+-            "title": article["title"],
+-            "description": article["description"],
+-            "body": article["body"],
+-            "tagList": article["tags"],
+-            "createdAt": article["created_date"],
+-            "updatedAt": article["updated_date"],
+-            "favorited": False,
+-            "favoritesCount": 0,
+-            "author": {
+-                "username": folliwng_user["username"],
+-                "bio": folliwng_user["bio"],
+-                "image": folliwng_user["image"],
+-                "following": True,
+-            },
+-        }
+-
+-
+-def test_get_article(client, add_article):
+-    article = add_article()
+-    resp = client.get(f"/api/articles/{article['slug']}")
+-    assert resp.status_code == 200
+-    assert resp.json["article"]["slug"] == article["slug"]
+-
+-
+-def test_create_article_unauthenticated(client):
+-    payload = {
+-        "article": {
+-            "title": "How to Article",
+-            "description": "A test article.",
+-            "body": "This is just a test!",
+-            "tagList": ["test", "article"],
+-        }
+-    }
+-    resp = client.post("/api/articles", json=payload)
+-    assert resp.status_code == 401
+-
+-
+-def test_create_article(client, add_user):
+-    user = add_user()
+-    payload = {
+-        "article": {
+-            "title": "How to Article",
+-            "description": "A test article.",
+-            "body": "This is just a test!",
+-            "tagList": ["test", "article"],
+-        }
+-    }
+-    resp = client.post(
+-        "/api/articles",
+-        json=payload,
+-        headers={"Authorization": f"Token {generate_jwt(user['id'])}"},
+-    )
+-    assert resp.status_code == 200
+-    assert resp.json["article"]["title"] == payload["article"]["title"]
+-
+-
+-def test_update_article_unauthenticated(client, add_article):
+-    article = add_article()
+-    payload = {"article": {"title": "Updated Article"}}
+-    resp = client.put(f"/api/articles/{article['slug']}", json=payload)
+-    assert resp.status_code == 401
+-
+-
+-def test_update_article(client, add_user, add_article):
+-    user = add_user()
+-    article = add_article(author_user_id=user["id"])
+-    payload = {"article": {"title": "Updated Article"}}
+-    resp = client.put(
+-        f"/api/articles/{article['slug']}",
+-        json=payload,
+-        headers={"Authorization": f"Token {generate_jwt(user['id'])}"},
+-    )
+-    assert resp.status_code == 200
+-    assert resp.json["article"]["title"] == payload["article"]["title"]
+-
+-
+-def test_delete_article_unauthenticated(client, add_article):
+-    article = add_article()
+-    resp = client.delete(f"/api/articles/{article['slug']}")
+-    assert resp.status_code == 401
+-
+-
+-def test_delete_article(client, add_user, add_article):
+-    user = add_user()
+-    article = add_article(author_user_id=user["id"])
+-    resp = client.delete(
+-        f"/api/articles/{article['slug']}",
+-        headers={"Authorization": f"Token {generate_jwt(user['id'])}"},
+-    )
+-    assert resp.status_code == 200
+-    assert resp.json["message"] == "Article deleted"
+-
+-
+-#
+-# Article Favorties Tests
+-#
+-def test_favorite_article(client, add_user, add_article):
+-    user = add_user()
+-    article = add_article()
+-    resp = client.post(
+-        f"/api/articles/{article['slug']}/favorite",
+-        headers={"Authorization": f"Token {generate_jwt(user['id'])}"},
+-    )
+-    assert resp.status_code == 200
+-    assert resp.json["article"]["favorited"] is True
+-
+-
+-def test_unfavorite_article(client, add_user, add_article, add_article_favorite):
+-    user = add_user()
+-    article = add_article()
+-    add_article_favorite(article_id=article["id"], user_id=user["id"])
+-    resp = client.delete(
+-        f"/api/articles/{article['slug']}/favorite",
+-        headers={"Authorization": f"Token {generate_jwt(user['id'])}"},
+-    )
+-    assert resp.status_code == 200
+-    assert resp.json["article"]["favorited"] is False
+-
+-
+-#
+-# Article Comments Tests
+-#
+-def test_get_comments(client, add_user, add_article, add_article_comment):
+-    user1, user_2 = add_user(), add_user()
+-    article = add_article()
+-    comments = [
+-        add_article_comment(article_id=article["id"], commenter_user_id=user1["id"]),
+-        add_article_comment(article_id=article["id"], commenter_user_id=user_2["id"]),
+-    ]
+-
+-    resp = client.get(f"/api/articles/{article['slug']}/comments")
+-    assert resp.status_code == 200
+-    assert resp.json["comments"] == [
+-        {
+-            "id": comment["id"],
+-            "createdAt": comment["created_date"],
+-            "updatedAt": comment["updated_date"],
+-            "body": comment["body"],
+-            "author": {
+-                "username": usr["username"],
+-                "bio": usr["bio"],
+-                "image": usr["image"],
+-                "following": False,
+-            },
+-        }
+-        for usr, comment in zip([user1, user_2], comments)
+-    ]
+-
+-
+-def test_create_comment(client, add_user, add_article):
+-    user = add_user()
+-    article = add_article()
+-    payload = {"comment": {"body": "A test comment."}}
+-    resp = client.post(
+-        f"/api/articles/{article['slug']}/comments",
+-        json=payload,
+-        headers={"Authorization": f"Token {generate_jwt(user['id'])}"},
+-    )
+-    assert resp.status_code == 200
+-    assert resp.json["comment"]["body"] == payload["comment"]["body"]
+-
+-
+-def test_delete_comment(client, add_user, add_article, add_article_comment):
+-    user = add_user()
+-    article = add_article()
+-    comment = add_article_comment(
+-        article_id=article["id"], commenter_user_id=user["id"]
+-    )
+-    resp = client.delete(
+-        f"/api/articles/{article['slug']}/comments/{comment['id']}",
+-        headers={"Authorization": f"Token {generate_jwt(user['id'])}"},
+-    )
+-    assert resp.status_code == 200
+-    assert resp.json["message"] == "Comment deleted"
+-
+-
+-#
+-# Article Comments Tests
+-#
+-def test_get_tags(client, add_article):
+-    add_article(tags=["mock"])
+-    add_article(tags=["test", "article"])
+-
+-    resp = client.get("/api/tags")
+-    assert resp.status_code == 200
+-    assert resp.json["tags"] == [
+-        "mock",
+-        "test",
+-        "article",
+-    ]
+diff --git a/tests/api/test_profiles.py b/tests/api/test_profiles.py
+deleted file mode 100644
+index da5ef7b..0000000
+--- a/tests/api/test_profiles.py
++++ /dev/null
+@@ -1,72 +0,0 @@
+-from pytest import mark
+-from realworld.api.core.auth import generate_jwt
+-
+-
+-#
+-# Profile Tests
+-#
+-def test_get_profile_dne_returns_404(client):
+-    usr = "mock-user"
+-    resp = client.get(f"/api/profiles/{usr}")
+-    assert resp.status_code == 404
+-
+-
+-@mark.parametrize("is_authenticated", [True, False])
+-@mark.parametrize("is_following", [True, False])
+-def test_get_profile(is_following, is_authenticated, client, add_user, add_user_follow):
+-    user1 = add_user(username="mock-user")
+-    user2 = add_user(username="mock-profile-user")
+-
+-    if is_following:
+-        add_user_follow(user_id=user1["id"], following_user_id=user2["id"])
+-
+-    headers = {}
+-    if is_authenticated:
+-        headers["Authorization"] = f"Token {generate_jwt(user1['id'])}"
+-
+-    resp = client.get(f"/api/profiles/{user2['username']}", headers=headers)
+-
+-    assert resp.status_code == 200
+-    assert resp.json["profile"] == {
+-        "username": user2["username"],
+-        "bio": user2["bio"],
+-        "image": user2["image"],
+-        "following": (is_following and is_authenticated),
+-    }
+-
+-
+-def test_follow_profile(client, add_user):
+-    user1 = add_user(username="mock-user")
+-    user2 = add_user(username="mock-profile-user")
+-
+-    resp = client.post(
+-        f"/api/profiles/{user2['username']}/follow",
+-        headers={"Authorization": f"Token {generate_jwt(user1['id'])}"},
+-    )
+-
+-    assert resp.status_code == 200
+-    assert resp.json["profile"] == {
+-        "username": user2["username"],
+-        "bio": user2["bio"],
+-        "image": user2["image"],
+-        "following": True,
+-    }
+-
+-
+-def test_unfollow_profile(client, add_user, add_user_follow):
+-    user1 = add_user(username="mock-user")
+-    user2 = add_user(username="mock-profile-user")
+-    add_user_follow(user_id=user1["id"], following_user_id=user2["id"])
+-
+-    resp = client.delete(
+-        f"/api/profiles/{user2['username']}/follow",
+-        headers={"Authorization": f"Token {generate_jwt(user1['id'])}"},
+-    )
+-
+-    assert resp.status_code == 200
+-    assert resp.json["profile"] == {
+-        "username": user2["username"],
+-        "bio": user2["bio"],
+-        "image": user2["image"],
+-        "following": False,
+-    }
+diff --git a/tests/api/test_tags.py b/tests/api/test_tags.py
+deleted file mode 100644
+index 2d426fb..0000000
+--- a/tests/api/test_tags.py
++++ /dev/null
+@@ -1,3 +0,0 @@
+-def test_get_tags(client):
+-    resp = client.get("/api/tags")
+-    assert resp.status_code == 200
+diff --git a/tests/api/test_users.py b/tests/api/test_users.py
+deleted file mode 100644
+index 24dd426..0000000
+--- a/tests/api/test_users.py
++++ /dev/null
+@@ -1,98 +0,0 @@
+-#
+-# User Tests
+-#
+-def test_create_user(client):
+-    payload = {
+-        "user": {
+-            "username": "mock-user",
+-            "email": "mock-user@realworld.io",
+-            "password": "password",
+-        }
+-    }
+-    resp = client.post("/api/users", json=payload)
+-    assert resp.status_code == 200
+-
+-
+-def test_create_duplicate_user_returns_400(client, add_user):
+-    payload = {
+-        "user": {
+-            "username": "mock-user",
+-            "email": "mock-user@realworld.io",
+-            "password": "password",
+-        }
+-    }
+-
+-    add_user(username="mock-user")
+-
+-    resp = client.post("/api/users", json=payload)
+-    assert resp.status_code == 409
+-    assert resp.json["error"] == "A user with this username already exists."
+-
+-
+-def test_authenticate_user(client, add_user):
+-    user = add_user()
+-    resp = client.post(
+-        "/api/users/login",
+-        json={"user": {"email": user["email"], "password": user["password"]}},
+-    )
+-
+-    assert resp.status_code == 200
+-    assert resp.json["user"]["email"] == user["email"]
+-    assert resp.json["user"]["username"] == user["username"]
+-    assert resp.json["user"]["bio"] == user["bio"]
+-    assert resp.json["user"]["image"] == user["image"]
+-    assert resp.json["user"]["token"] is not None
+-
+-
+-def test_get_current_user(client, add_user):
+-    user = add_user()
+-    resp = client.post(
+-        "/api/users/login",
+-        json={"user": {"email": user["email"], "password": "password"}},
+-    )
+-    jwt = resp.json["user"]["token"]
+-
+-    resp = client.get(
+-        "/api/user",
+-        headers={"Authorization": f"Token {jwt}"},
+-    )
+-    assert resp.status_code == 200
+-    assert resp.json == {
+-        "user": {
+-            "email": user["email"],
+-            "username": user["username"],
+-            "bio": user["bio"],
+-            "image": user["image"],
+-        }
+-    }
+-
+-
+-def test_update_user(client, add_user):
+-    user = add_user(username="will-update", password="password")
+-    resp = client.post(
+-        "/api/users/login",
+-        json={"user": {"email": user["email"], "password": "password"}},
+-    )
+-    jwt = resp.json["user"]["token"]
+-
+-    resp = client.put(
+-        "/api/user",
+-        headers={"Authorization": f"Token {jwt}"},
+-        json={
+-            "user": {
+-                "email": "updated@realworld.io",
+-                "bio": "updated bio",
+-                "image": "updated image",
+-            }
+-        },
+-    )
+-
+-    assert resp.status_code == 200
+-    assert resp.json == {
+-        "user": {
+-            "username": user["username"],
+-            "email": "updated@realworld.io",
+-            "bio": "updated bio",
+-            "image": "updated image",
+-        }
+-    }
+diff --git a/tests/conftest.py b/tests/conftest.py
+deleted file mode 100644
+index a025704..0000000
+--- a/tests/conftest.py
++++ /dev/null
+@@ -1,253 +0,0 @@
+-from uuid import uuid4
+-from pytest import fixture
+-from unittest.mock import patch
+-from realworld.app import create_app
+-from sqlalchemy import text as satext
+-from datetime import datetime, timezone as tz
+-from realworld.api.core.db import _ENGINE, _Session
+-from realworld.api.routes.v1.users.handler import hash_password
+-
+-# from realworld.api.core.auth import generate_jwt
+-# from .data import SESSION_USER_ID, SESSION_USER_NAME
+-
+-
+-####################
+-# App Fixtures
+-####################
+-
+-
+-@fixture(scope="session")
+-def test_app():
+-    app = create_app()
+-    app.config["TESTING"] = True
+-    return app
+-
+-
+-@fixture(scope="session")
+-def client(test_app):
+-    return test_app.test_client()
+-
+-
+-###########################################################
+-# DB Fixtures (rollback transaction after each unit test) #
+-###########################################################
+-
+-
+-@fixture(scope="session")
+-def mock_conn():
+-    connection = _ENGINE.connect()
+-    yield connection
+-    connection.close()
+-
+-
+-@fixture(scope="function")
+-def mock_db_session(mock_conn):
+-    transaction = mock_conn.begin()
+-    session = _Session(bind=mock_conn)
+-    yield session
+-    session.close()
+-    transaction.rollback()
+-
+-
+-@fixture(autouse=True)
+-def mock_get_db_connection(mock_db_session):
+-    with patch("realworld.api.core.db._create_db_connection") as mock_db_conn:
+-        mock_db_conn.return_value = mock_db_session, mock_db_session.connection()
+-        yield mock_db_conn
+-
+-
+-####################
+-# Data Fixtures
+-####################
+-
+-
+-@fixture(scope="function")
+-def add_user(mock_db_session):
+-    def _add_user(
+-        _id=None,
+-        username=None,
+-        email=None,
+-        password=None,
+-        image_url=None,
+-        bio=None,
+-        ts=None,
+-    ):
+-        _id = _id or str(uuid4())
+-        ts = ts or datetime.now(tz.utc).isoformat()
+-        username = username or f"mock-user-{_id}"
+-        password = password or "password"
+-        user = {
+-            "id": _id,
+-            "username": username,
+-            "email": email or f"{username}@realworld.io",
+-            "bio": bio or f"mock bio for {username}",
+-            "image": image_url or None,
+-            "password_hash": hash_password(password or "password"),
+-            "created_date": ts,
+-            "updated_date": ts,
+-        }
+-        stmt = satext(
+-            """
+-            INSERT INTO users (id, username, email, password_hash, image_url, bio, created_date, updated_date)
+-            VALUES (:id, :username, :email, :password_hash, :image, :bio, :created_date, :updated_date)
+-            """
+-        ).bindparams(**user)
+-        mock_db_session.execute(stmt)
+-
+-        # Reset user dict before returning
+-        user.pop("password_hash")
+-        user["password"] = password
+-        return user
+-
+-    return _add_user
+-
+-
+-# @fixture(scope="session")
+-# def session_user(add_user):
+-#     return add_user(_id=SESSION_USER_ID, username=SESSION_USER_NAME)
+-
+-
+-# @fixture(scope="function")
+-# def session_user_token(session_user):
+-#     return generate_jwt(session_user["id"])
+-
+-
+-@fixture(scope="function")
+-def add_user_follow(mock_db_session):
+-    def _add_user_follow(user_id, following_user_id):
+-        stmt = satext(
+-            """
+-            INSERT INTO user_follows (user_id, following_user_id)
+-            VALUES (:user_id, :following_user_id)
+-            """
+-        ).bindparams(user_id=user_id, following_user_id=following_user_id)
+-        mock_db_session.execute(stmt)
+-        return True
+-
+-    return _add_user_follow
+-
+-
+-@fixture(scope="function")
+-def add_article(mock_db_session, add_user):
+-    def _add_article(
+-        _id=None,
+-        author_user_id=None,
+-        slug=None,
+-        title=None,
+-        description=None,
+-        body=None,
+-        tags=None,
+-        ts=None,
+-    ):
+-        _id = _id or str(uuid4())
+-        ts = ts or datetime.now(tz.utc).isoformat()
+-        article = {
+-            "id": _id,
+-            "author_user_id": author_user_id or add_user()["id"],
+-            "slug": slug or f"mock-slug-{_id}",
+-            "title": title or f"Mock Title ({_id})",
+-            "description": description or f"Mock description of `Mock Title ({_id})`",
+-            "body": body or f"Mock body of `Mock Title ({_id})`",
+-            "tags": tags or ["mock"],
+-            "created_date": ts,
+-            "updated_date": ts,
+-        }
+-
+-        mock_db_session.execute(
+-            satext(
+-                """
+-                INSERT INTO articles (id, author_user_id, slug, title, description, body, created_date, updated_date)
+-                VALUES (:id, :author_user_id, :slug, :title, :description, :body, :created_date, :updated_date)
+-                """
+-            ),
+-            article,
+-        )
+-
+-        if article["tags"]:
+-            mock_db_session.execute(
+-                satext(
+-                    """
+-                    WITH upserted_tags AS (
+-                        INSERT INTO tags (name)
+-                        VALUES (:name)
+-                        ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+-                        RETURNING id
+-                    )
+-                    INSERT INTO article_tags (article_id, tag_id)
+-                    SELECT :article_id, id
+-                    FROM upserted_tags
+-                    """
+-                ),
+-                [{"name": tag, "article_id": article["id"]} for tag in article["tags"]],
+-            )
+-
+-        return article
+-
+-    return _add_article
+-
+-
+-@fixture(scope="function")
+-def add_article_favorite(mock_db_session):
+-    def _add_article_favorite(user_id=None, article_id=None):
+-        article_favorite = {
+-            "user_id": user_id or str(uuid4()),
+-            "article_id": article_id or str(uuid4()),
+-        }
+-
+-        stmt = satext(
+-            """
+-            INSERT INTO article_favorites (user_id, article_id)
+-            VALUES (:user_id, :article_id)
+-            """
+-        )
+-        mock_db_session.execute(stmt, article_favorite)
+-
+-        return article_favorite
+-
+-    return _add_article_favorite
+-
+-
+-@fixture(scope="function")
+-def add_article_comment(mock_db_session, add_user, add_article):
+-    def _add_article_comment(
+-        _id=None, article_id=None, commenter_user_id=None, body=None, ts=None
+-    ):
+-        _id = _id or str(uuid4())
+-        ts = ts or datetime.now(tz.utc).isoformat()
+-        article_id = article_id or add_article()["id"]
+-        article_comment = {
+-            "id": _id,
+-            "article_id": article_id,
+-            "commenter_user_id": commenter_user_id or add_user()["id"],
+-            "body": body or f"Mock comment body for article {article_id}",
+-            "created_date": ts,
+-            "updated_date": ts,
+-        }
+-
+-        stmt = satext(
+-            """
+-            INSERT INTO article_comments (id, article_id, commenter_user_id, body, created_date, updated_date)
+-            VALUES (:id, :article_id, :commenter_user_id, :body, :created_date, :updated_date)
+-            """
+-        )
+-        mock_db_session.execute(stmt, article_comment)
+-
+-        return article_comment
+-
+-    return _add_article_comment
+-
+-
+-# @fixture(scope="function")
+-# def add_tag(mock_db_session):
+-#     def _add_tag(tag=None):
+-#         tag = tag or f"mock-tag-{randint(0, 100)}"
+-#         stmt = satext(
+-#             """
+-#             INSERT INTO tags (tag)
+-#             VALUES (:tag)
+-#             """
+-#         )
+-#         mock_db_session.execute(stmt, {"tag": tag})
+-#         return tag
+-
+-#     return _add_tag
+diff --git a/tests/data.py b/tests/data.py
+deleted file mode 100644
+index 2d3f19f..0000000
+--- a/tests/data.py
++++ /dev/null
+@@ -1,2 +0,0 @@
+-SESSION_USER_ID = "00000000-0000-0000-0000-000000000001"
+-SESSION_USER_NAME = "session-user"

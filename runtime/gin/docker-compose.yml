@@ -1,0 +1,18 @@
+services:
+  conduit:
+    build: .
+    image: apibench/gin
+    tty: true
+    networks: [realworld]
+
+  newman:
+    build: ../newman
+    image: apibench/newman
+    tty: true
+    networks: [realworld]
+    depends_on:
+      conduit:
+        condition: service_started
+
+networks:
+  realworld: {}

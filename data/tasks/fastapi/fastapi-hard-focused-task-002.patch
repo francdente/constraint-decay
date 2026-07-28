@@ -1,0 +1,4424 @@
+diff --git a/conduit/api/router.py b/conduit/api/router.py
+index 83b8400..19af044 100644
+--- a/conduit/api/router.py
++++ b/conduit/api/router.py
+@@ -5,7 +5,6 @@ from conduit.api.routes import (
+     authentication,
+     comment,
+     health_check,
+-    profile,
+     tag,
+     users,
+ )
+@@ -19,7 +18,6 @@ router.include_router(
+     router=authentication.router, tags=["Authentication"], prefix="/users"
+ )
+ router.include_router(router=users.router, tags=["User"], prefix="/user")
+-router.include_router(router=profile.router, tags=["Profiles"], prefix="/profiles")
+ router.include_router(router=tag.router, tags=["Tags"], prefix="/tags")
+ router.include_router(router=article.router, tags=["Articles"], prefix="/articles")
+ router.include_router(router=comment.router, tags=["Comments"], prefix="/articles")
+diff --git a/conduit/api/routes/profile.py b/conduit/api/routes/profile.py
+deleted file mode 100644
+index 80c96a6..0000000
+--- a/conduit/api/routes/profile.py
++++ /dev/null
+@@ -1,65 +0,0 @@
+-from fastapi import APIRouter
+-
+-from conduit.api.schemas.responses.profile import ProfileResponse
+-from conduit.core.dependencies import (
+-    CurrentOptionalUser,
+-    CurrentUser,
+-    DBSession,
+-    IProfileService,
+-)
+-
+-router = APIRouter()
+-
+-
+-@router.get("/{username}", response_model=ProfileResponse)
+-async def get_user_profile(
+-    username: str,
+-    session: DBSession,
+-    current_user: CurrentOptionalUser,
+-    profile_service: IProfileService,
+-) -> ProfileResponse:
+-    """
+-    Return user profile information.
+-    """
+-    profile_dto = await profile_service.get_profile_by_username(
+-        session=session, username=username, current_user=current_user
+-    )
+-    return ProfileResponse.from_dto(dto=profile_dto)
+-
+-
+-@router.post("/{username}/follow", response_model=ProfileResponse)
+-async def follow_username(
+-    username: str,
+-    session: DBSession,
+-    current_user: CurrentUser,
+-    profile_service: IProfileService,
+-) -> ProfileResponse:
+-    """
+-    Follow profile with specific username.
+-    """
+-    await profile_service.follow_user(
+-        session=session, username=username, current_user=current_user
+-    )
+-    profile_dto = await profile_service.get_profile_by_username(
+-        session=session, username=username, current_user=current_user
+-    )
+-    return ProfileResponse.from_dto(dto=profile_dto)
+-
+-
+-@router.delete("/{username}/follow", response_model=ProfileResponse)
+-async def unfollow_username(
+-    username: str,
+-    session: DBSession,
+-    current_user: CurrentUser,
+-    profile_service: IProfileService,
+-) -> ProfileResponse:
+-    """
+-    Unfollow profile with specific username
+-    """
+-    await profile_service.unfollow_user(
+-        session=session, username=username, current_user=current_user
+-    )
+-    profile_dto = await profile_service.get_profile_by_username(
+-        session=session, username=username, current_user=current_user
+-    )
+-    return ProfileResponse.from_dto(dto=profile_dto)
+diff --git a/conduit/api/schemas/responses/profile.py b/conduit/api/schemas/responses/profile.py
+deleted file mode 100644
+index 89348f6..0000000
+--- a/conduit/api/schemas/responses/profile.py
++++ /dev/null
+@@ -1,25 +0,0 @@
+-from pydantic import BaseModel
+-
+-from conduit.dtos.domain.profile import ProfileDTO
+-
+-
+-class ProfileData(BaseModel):
+-    username: str
+-    bio: str | None
+-    image: str | None
+-    following: bool
+-
+-
+-class ProfileResponse(BaseModel):
+-    profile: ProfileData
+-
+-    @classmethod
+-    def from_dto(cls, dto: ProfileDTO) -> "ProfileResponse":
+-        return ProfileResponse(
+-            profile=ProfileData(
+-                username=dto.username,
+-                bio=dto.bio,
+-                image=dto.image,
+-                following=dto.following,
+-            )
+-        )
+diff --git a/conduit/core/container.py b/conduit/core/container.py
+index fb2c9f2..8318e73 100644
+--- a/conduit/core/container.py
++++ b/conduit/core/container.py
+@@ -23,14 +23,12 @@ from conduit.interfaces.services.article import IArticleService
+ from conduit.interfaces.services.auth import IUserAuthService
+ from conduit.interfaces.services.auth_token import IAuthTokenService
+ from conduit.interfaces.services.comment import ICommentService
+-from conduit.interfaces.services.profile import IProfileService
+ from conduit.interfaces.services.tag import ITagService
+ from conduit.interfaces.services.user import IUserService
+ from conduit.services.article import ArticleService
+ from conduit.services.auth import UserAuthService
+ from conduit.services.auth_token import AuthTokenService
+ from conduit.services.comment import CommentService
+-from conduit.services.profile import ProfileService
+ from conduit.services.tag import TagService
+ from conduit.services.user import UserService
+ 
+@@ -105,11 +103,6 @@ class Container:
+     def user_service(self) -> IUserService:
+         return UserService(user_repo=self.user_repository())
+ 
+-    def profile_service(self) -> IProfileService:
+-        return ProfileService(
+-            user_service=self.user_service(), follower_repo=self.follower_repository()
+-        )
+-
+     def tag_service(self) -> ITagService:
+         return TagService(tag_repo=self.tags_repository())
+ 
+@@ -118,14 +111,12 @@ class Container:
+             article_repo=self.article_repository(),
+             article_tag_repo=self.article_tag_repository(),
+             favorite_repo=self.favorite_repository(),
+-            profile_service=self.profile_service(),
+         )
+ 
+     def comment_service(self) -> ICommentService:
+         return CommentService(
+             article_repo=self.article_repository(),
+             comment_repo=self.comment_repository(),
+-            profile_service=self.profile_service(),
+         )
+ 
+ 
+diff --git a/conduit/core/dependencies.py b/conduit/core/dependencies.py
+index 4b646af..2abb1de 100644
+--- a/conduit/core/dependencies.py
++++ b/conduit/core/dependencies.py
+@@ -9,7 +9,6 @@ from conduit.core.providers import (
+     get_auth_token_service,
+     get_comment_service,
+     get_db_session,
+-    get_profile_service,
+     get_tag_service,
+     get_user_auth_service,
+     get_user_service,
+@@ -20,7 +19,6 @@ from conduit.services.article import ArticleService
+ from conduit.services.auth import UserAuthService
+ from conduit.services.auth_token import AuthTokenService
+ from conduit.services.comment import CommentService
+-from conduit.services.profile import ProfileService
+ from conduit.services.tag import TagService
+ from conduit.services.user import UserService
+ 
+@@ -45,7 +43,6 @@ DBSession = Annotated[AsyncSession, Depends(get_db_session)]
+ IAuthTokenService = Annotated[AuthTokenService, Depends(get_auth_token_service)]
+ IUserAuthService = Annotated[UserAuthService, Depends(get_user_auth_service)]
+ IUserService = Annotated[UserService, Depends(get_user_service)]
+-IProfileService = Annotated[ProfileService, Depends(get_profile_service)]
+ ITagService = Annotated[TagService, Depends(get_tag_service)]
+ IArticleService = Annotated[ArticleService, Depends(get_article_service)]
+ ICommentService = Annotated[CommentService, Depends(get_comment_service)]
+diff --git a/conduit/core/exceptions.py b/conduit/core/exceptions.py
+index 50b08d2..c76b28f 100644
+--- a/conduit/core/exceptions.py
++++ b/conduit/core/exceptions.py
+@@ -155,34 +155,6 @@ class IncorrectJWTTokenException(BaseInternalException):
+     _message = "Invalid JWT token."
+ 
+ 
+-class ProfileNotFoundException(BaseInternalException):
+-    """Exception raised when specific profile not found."""
+-
+-    _status_code = 404
+-    _message = "Profile with this username does not exist."
+-
+-
+-class OwnProfileFollowingException(BaseInternalException):
+-    """Exception raised when user is trying to follow own profile."""
+-
+-    _status_code = 403
+-    _message = "Own profile cannot be followed or unfollowed."
+-
+-
+-class ProfileAlreadyFollowedException(BaseInternalException):
+-    """Exception raised when user is trying to follow already followed profile."""
+-
+-    _status_code = 400
+-    _message = "Profile already followed."
+-
+-
+-class ProfileNotFollowedFollowedException(BaseInternalException):
+-    """Exception raised when user is trying to unfollow not followed profile."""
+-
+-    _status_code = 400
+-    _message = "Profile was not followed."
+-
+-
+ class RateLimitExceededException(BaseInternalException):
+     """Exception raised when rate limit exceeded during specific time."""
+ 
+diff --git a/conduit/core/providers.py b/conduit/core/providers.py
+index a0e4435..0002ff0 100644
+--- a/conduit/core/providers.py
++++ b/conduit/core/providers.py
+@@ -25,14 +25,12 @@ from conduit.interfaces.services.article import IArticleService
+ from conduit.interfaces.services.auth import IUserAuthService
+ from conduit.interfaces.services.auth_token import IAuthTokenService
+ from conduit.interfaces.services.comment import ICommentService
+-from conduit.interfaces.services.profile import IProfileService
+ from conduit.interfaces.services.tag import ITagService
+ from conduit.interfaces.services.user import IUserService
+ from conduit.services.article import ArticleService
+ from conduit.services.auth import UserAuthService
+ from conduit.services.auth_token import AuthTokenService
+ from conduit.services.comment import CommentService
+-from conduit.services.profile import ProfileService
+ from conduit.services.tag import TagService
+ from conduit.services.user import UserService
+ 
+@@ -92,13 +90,6 @@ def get_user_service() -> IUserService:
+     return UserService(user_repo=get_user_repo())
+ 
+ 
+-@lru_cache
+-def get_profile_service() -> IProfileService:
+-    return ProfileService(
+-        user_service=get_user_service(), follower_repo=get_follower_repo()
+-    )
+-
+-
+ @lru_cache
+ def get_user_auth_service() -> IUserAuthService:
+     return UserAuthService(
+@@ -117,7 +108,6 @@ def get_article_service() -> IArticleService:
+         article_repo=get_article_repo(),
+         article_tag_repo=get_article_tag_repo(),
+         favorite_repo=get_favorite_repo(),
+-        profile_service=get_profile_service(),
+     )
+ 
+ 
+@@ -126,5 +116,4 @@ def get_comment_service() -> ICommentService:
+     return CommentService(
+         article_repo=get_article_repo(),
+         comment_repo=get_comment_repo(),
+-        profile_service=get_profile_service(),
+     )
+diff --git a/conduit/dtos/domain/article.py b/conduit/dtos/domain/article.py
+index 975402b..cc6c30d 100644
+--- a/conduit/dtos/domain/article.py
++++ b/conduit/dtos/domain/article.py
+@@ -22,7 +22,6 @@ class ArticleDTO:
+     description: str
+     body: str
+     tags: list[str]
+-    author: ArticleAuthorDTO
+     created_at: datetime.datetime
+     updated_at: datetime.datetime
+     favorited: bool
+@@ -38,7 +37,6 @@ class ArticleDTO:
+     def from_record(
+         cls,
+         record: ArticleRecordDTO,
+-        author: ArticleAuthorDTO,
+         tags: list[str],
+         favorited: bool,
+         favorites_count: int,
+@@ -51,7 +49,6 @@ class ArticleDTO:
+             description=record.description,
+             body=record.body,
+             tags=tags,
+-            author=author,
+             created_at=record.created_at,
+             updated_at=record.updated_at,
+             favorited=favorited,
+@@ -68,12 +65,6 @@ class ArticleDTO:
+             description=record.description,
+             body=record.body,
+             tags=record.tags,
+-            author=ArticleAuthorDTO(
+-                username=record.author_username,
+-                bio=record.author_bio or "",
+-                image=record.author_image,
+-                following=record.author_following,
+-            ),
+             created_at=record.created_at,
+             updated_at=record.updated_at,
+             favorited=record.favorited,
+diff --git a/conduit/dtos/domain/comment.py b/conduit/dtos/domain/comment.py
+index b531460..3e24383 100644
+--- a/conduit/dtos/domain/comment.py
++++ b/conduit/dtos/domain/comment.py
+@@ -1,7 +1,6 @@
+ import datetime
+ from dataclasses import dataclass
+ 
+-from conduit.dtos.domain.profile import ProfileDTO
+ from conduit.dtos.records.comment import CommentRecordDTO
+ 
+ 
+@@ -9,16 +8,14 @@ from conduit.dtos.records.comment import CommentRecordDTO
+ class CommentDTO:
+     id: int
+     body: str
+-    author: ProfileDTO
+     created_at: datetime.datetime
+     updated_at: datetime.datetime
+ 
+     @classmethod
+-    def from_record(cls, record: CommentRecordDTO, author: ProfileDTO) -> "CommentDTO":
++    def from_record(cls, record: CommentRecordDTO) -> "CommentDTO":
+         return cls(
+             id=record.id,
+             body=record.body,
+-            author=author,
+             created_at=record.created_at,
+             updated_at=record.updated_at,
+         )
+diff --git a/conduit/dtos/domain/profile.py b/conduit/dtos/domain/profile.py
+deleted file mode 100644
+index fade89c..0000000
+--- a/conduit/dtos/domain/profile.py
++++ /dev/null
+@@ -1,22 +0,0 @@
+-from dataclasses import dataclass
+-
+-from conduit.dtos.domain.user import UserDTO
+-
+-
+-@dataclass(frozen=True)
+-class ProfileDTO:
+-    user_id: int
+-    username: str
+-    bio: str = ""
+-    image: str | None = None
+-    following: bool = False
+-
+-    @classmethod
+-    def from_user(cls, user: UserDTO, following: bool) -> "ProfileDTO":
+-        return cls(
+-            user_id=user.id,
+-            username=user.username,
+-            bio=user.bio,
+-            image=user.image,
+-            following=following,
+-        )
+diff --git a/conduit/interfaces/services/profile.py b/conduit/interfaces/services/profile.py
+deleted file mode 100644
+index ffe93a2..0000000
+--- a/conduit/interfaces/services/profile.py
++++ /dev/null
+@@ -1,32 +0,0 @@
+-import abc
+-from typing import Any
+-
+-from conduit.dtos.domain.profile import ProfileDTO
+-from conduit.dtos.domain.user import UserDTO
+-
+-
+-class IProfileService(abc.ABC):
+-    @abc.abstractmethod
+-    async def get_profile_by_username(
+-        self, session: Any, username: str, current_user: UserDTO | None = None
+-    ) -> ProfileDTO: ...
+-
+-    @abc.abstractmethod
+-    async def get_profile_by_user_id(
+-        self, session: Any, user_id: int, current_user: UserDTO | None = None
+-    ) -> ProfileDTO: ...
+-
+-    @abc.abstractmethod
+-    async def get_profiles_by_user_ids(
+-        self, session: Any, user_ids: list[int], current_user: UserDTO | None
+-    ) -> list[ProfileDTO]: ...
+-
+-    @abc.abstractmethod
+-    async def follow_user(
+-        self, session: Any, username: str, current_user: UserDTO
+-    ) -> None: ...
+-
+-    @abc.abstractmethod
+-    async def unfollow_user(
+-        self, session: Any, username: str, current_user: UserDTO
+-    ) -> None: ...
+diff --git a/conduit/services/article.py b/conduit/services/article.py
+index ba7b06a..7df766f 100644
+--- a/conduit/services/article.py
++++ b/conduit/services/article.py
+@@ -14,14 +14,12 @@ from conduit.dtos.domain.article import (
+     CreateArticleDTO,
+     UpdateArticleDTO,
+ )
+-from conduit.dtos.domain.profile import ProfileDTO
+ from conduit.dtos.domain.user import UserDTO
+ from conduit.dtos.records.article import ArticleFeedRecordDTO, ArticleRecordDTO
+ from conduit.interfaces.repositories.article import IArticleRepository
+ from conduit.interfaces.repositories.article_tag import IArticleTagRepository
+ from conduit.interfaces.repositories.favorite import IFavoriteRepository
+ from conduit.interfaces.services.article import IArticleService
+-from conduit.interfaces.services.profile import IProfileService
+ 
+ 
+ class ArticleService(IArticleService):
+@@ -32,12 +30,10 @@ class ArticleService(IArticleService):
+         article_repo: IArticleRepository,
+         article_tag_repo: IArticleTagRepository,
+         favorite_repo: IFavoriteRepository,
+-        profile_service: IProfileService,
+     ) -> None:
+         self._article_repo = article_repo
+         self._article_tag_repo = article_tag_repo
+         self._favorite_repo = favorite_repo
+-        self._profile_service = profile_service
+ 
+     async def create_new_article(
+         self, session: AsyncSession, author_id: int, article_to_create: CreateArticleDTO
+@@ -48,22 +44,14 @@ class ArticleService(IArticleService):
+             )
+         except (NoResultFound, MultipleResultsFound) as exc:
+             raise ArticleCreateException() from exc
+-        profile = await self._profile_service.get_profile_by_user_id(
+-            session=session, user_id=author_id
+-        )
++
+         if article_to_create.tags:
+             await self._article_tag_repo.add_many(
+                 session=session, article_id=article.id, tags=article_to_create.tags
+             )
+-        author = ArticleAuthorDTO(
+-            username=profile.username,
+-            bio=profile.bio,
+-            image=profile.image,
+-            following=profile.following,
+-        )
++
+         return ArticleDTO.from_record(
+             record=article,
+-            author=author,
+             tags=article_to_create.tags,
+             favorited=False,
+             favorites_count=0,
+@@ -73,13 +61,10 @@ class ArticleService(IArticleService):
+         self, session: AsyncSession, slug: str, current_user: UserDTO | None
+     ) -> ArticleDTO:
+         article = await self._article_repo.get_by_slug(session=session, slug=slug)
+-        profile = await self._profile_service.get_profile_by_user_id(
+-            session=session, user_id=article.author_id, current_user=current_user
+-        )
++
+         return await self._get_article_info(
+             session=session,
+             article=article,
+-            profile=profile,
+             user_id=current_user.id if current_user else None,
+         )
+ 
+@@ -108,11 +93,9 @@ class ArticleService(IArticleService):
+         article = await self._article_repo.update_by_slug(
+             session=session, slug=slug, update_item=article_to_update
+         )
+-        profile = await self._profile_service.get_profile_by_user_id(
+-            session=session, user_id=article.author_id, current_user=current_user
+-        )
++
+         return await self._get_article_info(
+-            session=session, article=article, profile=profile, user_id=current_user.id
++            session=session, article=article, user_id=current_user.id
+         )
+ 
+     async def get_articles_by_filters(
+@@ -203,7 +186,6 @@ class ArticleService(IArticleService):
+         self,
+         session: AsyncSession,
+         article: ArticleRecordDTO,
+-        profile: ProfileDTO,
+         user_id: int | None = None,
+     ) -> ArticleDTO:
+         article_tags = [
+@@ -222,33 +204,14 @@ class ArticleService(IArticleService):
+             if user_id
+             else False
+         )
+-        author = ArticleAuthorDTO(
+-            username=profile.username,
+-            bio=profile.bio,
+-            image=profile.image,
+-            following=profile.following,
+-        )
++
+         return ArticleDTO.from_record(
+             record=article,
+-            author=author,
+             tags=article_tags,
+             favorited=is_favorited_by_user,
+             favorites_count=favorites_count,
+         )
+ 
+-    async def _get_profiles_mapping(
+-        self,
+-        session: AsyncSession,
+-        articles: list[ArticleRecordDTO],
+-        current_user: UserDTO | None,
+-    ) -> dict[int, ProfileDTO]:
+-        following_profiles = await self._profile_service.get_profiles_by_user_ids(
+-            session=session,
+-            user_ids=[article.author_id for article in articles],
+-            current_user=current_user,
+-        )
+-        return {profile.user_id: profile for profile in following_profiles}
+-
+     @staticmethod
+     def _to_article_dto_from_feed_record(record: ArticleFeedRecordDTO) -> ArticleDTO:
+         return ArticleDTO.from_feed_record(record=record)
+diff --git a/conduit/services/comment.py b/conduit/services/comment.py
+index 96bd808..8a16d4f 100644
+--- a/conduit/services/comment.py
++++ b/conduit/services/comment.py
+@@ -3,13 +3,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+ from conduit.core.exceptions import CommentCreateException, CommentPermissionException
+ from conduit.dtos.domain.comment import CommentDTO, CommentsListDTO, CreateCommentDTO
+-from conduit.dtos.domain.profile import ProfileDTO
+ from conduit.dtos.domain.user import UserDTO
+ from conduit.dtos.records.comment import CommentRecordDTO
+ from conduit.interfaces.repositories.article import IArticleRepository
+ from conduit.interfaces.repositories.comment import ICommentRepository
+ from conduit.interfaces.services.comment import ICommentService
+-from conduit.interfaces.services.profile import IProfileService
+ 
+ 
+ class CommentService(ICommentService):
+@@ -17,11 +15,9 @@ class CommentService(ICommentService):
+         self,
+         article_repo: IArticleRepository,
+         comment_repo: ICommentRepository,
+-        profile_service: IProfileService,
+     ) -> None:
+         self._article_repo = article_repo
+         self._comment_repo = comment_repo
+-        self._profile_service = profile_service
+ 
+     async def create_article_comment(
+         self,
+@@ -31,7 +27,6 @@ class CommentService(ICommentService):
+         current_user: UserDTO,
+     ) -> CommentDTO:
+         article = await self._article_repo.get_by_slug(session=session, slug=slug)
+-        profile = ProfileDTO.from_user(user=current_user, following=False)
+         try:
+             comment_record_dto = await self._comment_repo.add(
+                 session=session,
+@@ -41,7 +36,7 @@ class CommentService(ICommentService):
+             )
+         except (NoResultFound, MultipleResultsFound) as exc:
+             raise CommentCreateException() from exc
+-        return CommentDTO.from_record(record=comment_record_dto, author=profile)
++        return CommentDTO.from_record(record=comment_record_dto)
+ 
+     async def get_article_comments(
+         self, session: AsyncSession, slug: str, current_user: UserDTO | None = None
+@@ -50,12 +45,9 @@ class CommentService(ICommentService):
+         comment_records = await self._comment_repo.list(
+             session=session, article_id=article.id
+         )
+-        profiles_map = await self._get_profiles_mapping(
+-            session=session, comments=comment_records, current_user=current_user
+-        )
+         comments = [
+             CommentDTO.from_record(
+-                comment_record_dto, profiles_map[comment_record_dto.author_id]
++                comment_record_dto
+             )
+             for comment_record_dto in comment_records
+         ]
+@@ -75,16 +67,3 @@ class CommentService(ICommentService):
+             raise CommentPermissionException()
+ 
+         await self._comment_repo.delete(session=session, comment_id=comment_id)
+-
+-    async def _get_profiles_mapping(
+-        self,
+-        session: AsyncSession,
+-        comments: list[CommentRecordDTO],
+-        current_user: UserDTO | None,
+-    ) -> dict[int, ProfileDTO]:
+-        comments_profiles = await self._profile_service.get_profiles_by_user_ids(
+-            session=session,
+-            user_ids=list({comment.author_id for comment in comments}),
+-            current_user=current_user,
+-        )
+-        return {profile.user_id: profile for profile in comments_profiles}
+diff --git a/conduit/services/profile.py b/conduit/services/profile.py
+deleted file mode 100644
+index 08d2e82..0000000
+--- a/conduit/services/profile.py
++++ /dev/null
+@@ -1,122 +0,0 @@
+-from sqlalchemy.ext.asyncio import AsyncSession
+-from structlog import get_logger
+-
+-from conduit.core.exceptions import (
+-    OwnProfileFollowingException,
+-    ProfileAlreadyFollowedException,
+-    ProfileNotFollowedFollowedException,
+-    ProfileNotFoundException,
+-    UserNotFoundException,
+-)
+-from conduit.dtos.domain.profile import ProfileDTO
+-from conduit.dtos.domain.user import UserDTO
+-from conduit.interfaces.repositories.follower import IFollowerRepository
+-from conduit.interfaces.services.profile import IProfileService
+-from conduit.interfaces.services.user import IUserService
+-
+-logger = get_logger()
+-
+-
+-class ProfileService(IProfileService):
+-    """Service to handle user profiles and following logic."""
+-
+-    def __init__(self, user_service: IUserService, follower_repo: IFollowerRepository):
+-        self._user_service = user_service
+-        self._follower_repo = follower_repo
+-
+-    async def get_profile_by_username(
+-        self, session: AsyncSession, username: str, current_user: UserDTO | None = None
+-    ) -> ProfileDTO:
+-        try:
+-            target_user = await self._user_service.get_user_by_username(
+-                session=session, username=username
+-            )
+-        except UserNotFoundException:
+-            logger.exception("Profile not found", username=username)
+-            raise ProfileNotFoundException()
+-        following = (
+-            await self._follower_repo.exists(
+-                session=session,
+-                follower_id=current_user.id,
+-                following_id=target_user.id,
+-            )
+-            if current_user
+-            else False
+-        )
+-        return ProfileDTO.from_user(user=target_user, following=following)
+-
+-    async def get_profile_by_user_id(
+-        self, session: AsyncSession, user_id: int, current_user: UserDTO | None = None
+-    ) -> ProfileDTO:
+-        target_user = await self._user_service.get_user_by_id(
+-            session=session, user_id=user_id
+-        )
+-        following = (
+-            await self._follower_repo.exists(
+-                session=session,
+-                follower_id=current_user.id,
+-                following_id=target_user.id,
+-            )
+-            if current_user
+-            else False
+-        )
+-        return ProfileDTO.from_user(user=target_user, following=following)
+-
+-    async def get_profiles_by_user_ids(
+-        self, session: AsyncSession, user_ids: list[int], current_user: UserDTO | None
+-    ) -> list[ProfileDTO]:
+-        target_users = await self._user_service.get_users_by_ids(
+-            session=session, user_ids=user_ids
+-        )
+-        following_user_ids = (
+-            await self._follower_repo.list(
+-                session=session,
+-                follower_id=current_user.id,
+-                following_ids=[user.id for user in target_users],
+-            )
+-            if current_user
+-            else []
+-        )
+-        return [
+-            ProfileDTO.from_user(
+-                user=user_dto, following=user_dto.id in following_user_ids
+-            )
+-            for user_dto in target_users
+-        ]
+-
+-    async def follow_user(
+-        self, session: AsyncSession, username: str, current_user: UserDTO
+-    ) -> None:
+-        if username == current_user.username:
+-            raise OwnProfileFollowingException()
+-
+-        target_user = await self._user_service.get_user_by_username(
+-            session=session, username=username
+-        )
+-        if await self._follower_repo.exists(
+-            session, follower_id=current_user.id, following_id=target_user.id
+-        ):
+-            raise ProfileAlreadyFollowedException()
+-
+-        await self._follower_repo.create(
+-            session=session, follower_id=current_user.id, following_id=target_user.id
+-        )
+-
+-    async def unfollow_user(
+-        self, session: AsyncSession, username: str, current_user: UserDTO
+-    ) -> None:
+-        if username == current_user.username:
+-            raise OwnProfileFollowingException()
+-
+-        target_user = await self._user_service.get_user_by_username(
+-            session=session, username=username
+-        )
+-        if not await self._follower_repo.exists(
+-            session, follower_id=current_user.id, following_id=target_user.id
+-        ):
+-            logger.exception("User not followed", username=username)
+-            raise ProfileNotFollowedFollowedException()
+-
+-        await self._follower_repo.delete(
+-            session=session, follower_id=current_user.id, following_id=target_user.id
+-        )
+diff --git a/postman/Conduit.postman_collection.json b/postman/Conduit.postman_collection.json
+deleted file mode 100644
+index 17642f9..0000000
+--- a/postman/Conduit.postman_collection.json
++++ /dev/null
+@@ -1,2182 +0,0 @@
+-{
+-  "info": {
+-    "_postman_id": "0574ad8a-a525-43ae-8e1e-5fd9756037f4",
+-    "name": "Conduit",
+-    "description": "Collection for testing the Conduit API\n\nhttps://github.com/gothinkster/realworld",
+-    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+-  },
+-  "item": [
+-    {
+-      "name": "Auth",
+-      "item": [
+-        {
+-          "name": "Register",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "if (!(environment.isIntegrationTest)) {",
+-                  "var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "tests['Response contains \"user\" property'] = responseJSON.hasOwnProperty('user');",
+-                  "",
+-                  "var user = responseJSON.user || {};",
+-                  "",
+-                  "tests['User has \"email\" property'] = user.hasOwnProperty('email');",
+-                  "tests['User has \"username\" property'] = user.hasOwnProperty('username');",
+-                  "tests['User has \"bio\" property'] = user.hasOwnProperty('bio');",
+-                  "tests['User has \"image\" property'] = user.hasOwnProperty('image');",
+-                  "tests['User has \"token\" property'] = user.hasOwnProperty('token');",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "POST",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": "{\"user\":{\"email\":\"{{EMAIL}}\", \"password\":\"{{PASSWORD}}\", \"username\":\"{{USERNAME}}\"}}"
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/users",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "users"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Login",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "tests['Response contains \"user\" property'] = responseJSON.hasOwnProperty('user');",
+-                  "",
+-                  "var user = responseJSON.user || {};",
+-                  "",
+-                  "tests['User has \"email\" property'] = user.hasOwnProperty('email');",
+-                  "tests['User has \"username\" property'] = user.hasOwnProperty('username');",
+-                  "tests['User has \"bio\" property'] = user.hasOwnProperty('bio');",
+-                  "tests['User has \"image\" property'] = user.hasOwnProperty('image');",
+-                  "tests['User has \"token\" property'] = user.hasOwnProperty('token');",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "POST",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": "{\"user\":{\"email\":\"{{EMAIL}}\", \"password\":\"{{PASSWORD}}\"}}"
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/users/login",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "users",
+-                "login"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Login and Remember Token",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "id": "a7674032-bf09-4ae7-8224-4afa2fb1a9f9",
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "tests['Response contains \"user\" property'] = responseJSON.hasOwnProperty('user');",
+-                  "",
+-                  "var user = responseJSON.user || {};",
+-                  "",
+-                  "tests['User has \"email\" property'] = user.hasOwnProperty('email');",
+-                  "tests['User has \"username\" property'] = user.hasOwnProperty('username');",
+-                  "tests['User has \"bio\" property'] = user.hasOwnProperty('bio');",
+-                  "tests['User has \"image\" property'] = user.hasOwnProperty('image');",
+-                  "tests['User has \"token\" property'] = user.hasOwnProperty('token');",
+-                  "",
+-                  "if(tests['User has \"token\" property']){",
+-                  "    pm.globals.set('token', user.token);",
+-                  "}",
+-                  "",
+-                  "tests['Global variable \"token\" has been set'] = pm.globals.get('token') === user.token;",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "POST",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": "{\"user\":{\"email\":\"{{EMAIL}}\", \"password\":\"{{PASSWORD}}\"}}"
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/users/login",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "users",
+-                "login"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Current User",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "tests['Response contains \"user\" property'] = responseJSON.hasOwnProperty('user');",
+-                  "",
+-                  "var user = responseJSON.user || {};",
+-                  "",
+-                  "tests['User has \"email\" property'] = user.hasOwnProperty('email');",
+-                  "tests['User has \"username\" property'] = user.hasOwnProperty('username');",
+-                  "tests['User has \"bio\" property'] = user.hasOwnProperty('bio');",
+-                  "tests['User has \"image\" property'] = user.hasOwnProperty('image');",
+-                  "tests['User has \"token\" property'] = user.hasOwnProperty('token');",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/user",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "user"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Update User",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "tests['Response contains \"user\" property'] = responseJSON.hasOwnProperty('user');",
+-                  "",
+-                  "var user = responseJSON.user || {};",
+-                  "",
+-                  "tests['User has \"email\" property'] = user.hasOwnProperty('email');",
+-                  "tests['User has \"username\" property'] = user.hasOwnProperty('username');",
+-                  "tests['User has \"bio\" property'] = user.hasOwnProperty('bio');",
+-                  "tests['User has \"image\" property'] = user.hasOwnProperty('image');",
+-                  "tests['User has \"token\" property'] = user.hasOwnProperty('token');",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "PUT",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": "{\"user\":{\"email\":\"{{EMAIL}}\"}}"
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/user",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "user"
+-              ]
+-            }
+-          },
+-          "response": []
+-        }
+-      ]
+-    },
+-    {
+-      "name": "Articles",
+-      "item": [
+-        {
+-          "name": "All Articles",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "tests['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "    tests['Response contains \"articles\" property'] = responseJSON.hasOwnProperty('articles');",
+-                  "    tests['Response contains \"articlesCount\" property'] = responseJSON.hasOwnProperty('articlesCount');",
+-                  "    tests['articlesCount is an integer'] = Number.isInteger(responseJSON.articlesCount);",
+-                  "",
+-                  "    if(responseJSON.articles.length){",
+-                  "        var article = responseJSON.articles[0];",
+-                  "",
+-                  "        tests['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "        tests['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "        tests['Article has \"body\" property'] = article.hasOwnProperty('body');",
+-                  "        tests['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "        tests['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "        tests['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "        tests['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "        tests['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "        tests['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "        tests['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "        tests['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "        tests['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "        tests['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "        tests['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  "    } else {",
+-                  "        tests['articlesCount is 0 when feed is empty'] = responseJSON.articlesCount === 0;",
+-                  "    }",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Articles by Author",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "tests['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "    tests['Response contains \"articles\" property'] = responseJSON.hasOwnProperty('articles');",
+-                  "    tests['Response contains \"articlesCount\" property'] = responseJSON.hasOwnProperty('articlesCount');",
+-                  "    tests['articlesCount is an integer'] = Number.isInteger(responseJSON.articlesCount);",
+-                  "",
+-                  "    if(responseJSON.articles.length){",
+-                  "        var article = responseJSON.articles[0];",
+-                  "",
+-                  "        tests['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "        tests['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "        tests['Article has \"body\" property'] = article.hasOwnProperty('body');",
+-                  "        tests['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "        tests['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "        tests['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "        tests['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "        tests['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "        tests['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "        tests['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "        tests['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "        tests['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "        tests['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "        tests['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  "    } else {",
+-                  "        tests['articlesCount is 0 when feed is empty'] = responseJSON.articlesCount === 0;",
+-                  "    }",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles?author=johnjacob",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles"
+-              ],
+-              "query": [
+-                {
+-                  "key": "author",
+-                  "value": "johnjacob"
+-                }
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Articles Favorited by Username",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "tests['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "    ",
+-                  "    tests['Response contains \"articles\" property'] = responseJSON.hasOwnProperty('articles');",
+-                  "    tests['Response contains \"articlesCount\" property'] = responseJSON.hasOwnProperty('articlesCount');",
+-                  "    tests['articlesCount is an integer'] = Number.isInteger(responseJSON.articlesCount);",
+-                  "",
+-                  "    if(responseJSON.articles.length){",
+-                  "        var article = responseJSON.articles[0];",
+-                  "",
+-                  "        tests['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "        tests['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "        tests['Article has \"body\" property'] = article.hasOwnProperty('body');",
+-                  "        tests['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "        tests['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "        tests['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "        tests['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "        tests['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "        tests['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "        tests['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "        tests['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "        tests['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "        tests['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "        tests['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  "    } else {",
+-                  "        tests['articlesCount is 0 when feed is empty'] = responseJSON.articlesCount === 0;",
+-                  "    }",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles?favorited={{USERNAME}}",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles"
+-              ],
+-              "query": [
+-                {
+-                  "key": "favorited",
+-                  "value": "{{USERNAME}}"
+-                }
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Articles by Tag",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "tests['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "    tests['Response contains \"articles\" property'] = responseJSON.hasOwnProperty('articles');",
+-                  "    tests['Response contains \"articlesCount\" property'] = responseJSON.hasOwnProperty('articlesCount');",
+-                  "    tests['articlesCount is an integer'] = Number.isInteger(responseJSON.articlesCount);",
+-                  "",
+-                  "    if(responseJSON.articles.length){",
+-                  "        var article = responseJSON.articles[0];",
+-                  "",
+-                  "        tests['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "        tests['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "        tests['Article has \"body\" property'] = article.hasOwnProperty('body');",
+-                  "        tests['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "        tests['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "        tests['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "        tests['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "        tests['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "        tests['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "        tests['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "        tests['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "        tests['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "        tests['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "        tests['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  "    } else {",
+-                  "        tests['articlesCount is 0 when feed is empty'] = responseJSON.articlesCount === 0;",
+-                  "    }",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles?tag=dragons",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles"
+-              ],
+-              "query": [
+-                {
+-                  "key": "tag",
+-                  "value": "dragons"
+-                }
+-              ]
+-            }
+-          },
+-          "response": []
+-        }
+-      ]
+-    },
+-    {
+-      "name": "Articles, Favorite, Comments",
+-      "item": [
+-        {
+-          "name": "Create Article",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "id": "e711dbf8-8065-4ba8-8b74-f1639a7d8208",
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "tests['Response contains \"article\" property'] = responseJSON.hasOwnProperty('article');",
+-                  "",
+-                  "var article = responseJSON.article || {};",
+-                  "",
+-                  "tests['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "tests['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "pm.globals.set('slug', article.slug);",
+-                  "",
+-                  "tests['Article has \"body\" property'] = article.hasOwnProperty('body');",
+-                  "tests['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "tests['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "tests['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "tests['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "tests['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "tests['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "tests['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "tests['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "tests['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "tests['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "tests['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "POST",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": "{\"article\":{\"title\":\"How to train your dragon\", \"description\":\"Ever wonder how?\", \"body\":\"Very carefully.\", \"tagList\":[\"training\", \"dragons\"]}}"
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Feed",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "tests['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "    tests['Response contains \"articles\" property'] = responseJSON.hasOwnProperty('articles');",
+-                  "    tests['Response contains \"articlesCount\" property'] = responseJSON.hasOwnProperty('articlesCount');",
+-                  "    tests['articlesCount is an integer'] = Number.isInteger(responseJSON.articlesCount);",
+-                  "",
+-                  "    if(responseJSON.articles.length){",
+-                  "        var article = responseJSON.articles[0];",
+-                  "",
+-                  "        tests['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "        tests['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "        tests['Article has \"body\" property'] = article.hasOwnProperty('body');",
+-                  "        tests['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "        tests['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "        tests['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "        tests['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "        tests['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "        tests['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "        tests['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "        tests['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "        tests['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "        tests['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "        tests['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  "    } else {",
+-                  "        tests['articlesCount is 0 when feed is empty'] = responseJSON.articlesCount === 0;",
+-                  "    }",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles/feed",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles",
+-                "feed"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "All Articles",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "tests['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "    tests['Response contains \"articles\" property'] = responseJSON.hasOwnProperty('articles');",
+-                  "    tests['Response contains \"articlesCount\" property'] = responseJSON.hasOwnProperty('articlesCount');",
+-                  "    tests['articlesCount is an integer'] = Number.isInteger(responseJSON.articlesCount);",
+-                  "",
+-                  "    if(responseJSON.articles.length){",
+-                  "        var article = responseJSON.articles[0];",
+-                  "",
+-                  "        tests['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "        tests['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "        tests['Article has \"body\" property'] = article.hasOwnProperty('body');",
+-                  "        tests['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "        tests['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "        tests['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "        tests['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "        tests['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "        tests['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "        tests['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "        tests['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "        tests['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "        tests['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "        tests['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  "    } else {",
+-                  "        tests['articlesCount is 0 when feed is empty'] = responseJSON.articlesCount === 0;",
+-                  "    }",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "All Articles with auth",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "tests['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "    tests['Response contains \"articles\" property'] = responseJSON.hasOwnProperty('articles');",
+-                  "    tests['Response contains \"articlesCount\" property'] = responseJSON.hasOwnProperty('articlesCount');",
+-                  "    tests['articlesCount is an integer'] = Number.isInteger(responseJSON.articlesCount);",
+-                  "",
+-                  "    if(responseJSON.articles.length){",
+-                  "        var article = responseJSON.articles[0];",
+-                  "",
+-                  "        tests['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "        tests['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "        tests['Article has \"body\" property'] = article.hasOwnProperty('body');",
+-                  "        tests['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "        tests['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "        tests['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "        tests['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "        tests['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "        tests['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "        tests['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "        tests['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "        tests['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "        tests['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "        tests['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  "    } else {",
+-                  "        tests['articlesCount is 0 when feed is empty'] = responseJSON.articlesCount === 0;",
+-                  "    }",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Articles by Author",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "tests['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "    tests['Response contains \"articles\" property'] = responseJSON.hasOwnProperty('articles');",
+-                  "    tests['Response contains \"articlesCount\" property'] = responseJSON.hasOwnProperty('articlesCount');",
+-                  "    tests['articlesCount is an integer'] = Number.isInteger(responseJSON.articlesCount);",
+-                  "",
+-                  "    if(responseJSON.articles.length){",
+-                  "        var article = responseJSON.articles[0];",
+-                  "",
+-                  "        tests['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "        tests['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "        tests['Article has \"body\" property'] = article.hasOwnProperty('body');",
+-                  "        tests['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "        tests['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "        tests['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "        tests['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "        tests['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "        tests['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "        tests['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "        tests['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "        tests['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "        tests['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "        tests['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  "    } else {",
+-                  "        tests['articlesCount is 0 when feed is empty'] = responseJSON.articlesCount === 0;",
+-                  "    }",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles?author={{USERNAME}}",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles"
+-              ],
+-              "query": [
+-                {
+-                  "key": "author",
+-                  "value": "{{USERNAME}}"
+-                }
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Articles by Author with auth",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "tests['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "    tests['Response contains \"articles\" property'] = responseJSON.hasOwnProperty('articles');",
+-                  "    tests['Response contains \"articlesCount\" property'] = responseJSON.hasOwnProperty('articlesCount');",
+-                  "    tests['articlesCount is an integer'] = Number.isInteger(responseJSON.articlesCount);",
+-                  "",
+-                  "    if(responseJSON.articles.length){",
+-                  "        var article = responseJSON.articles[0];",
+-                  "",
+-                  "        tests['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "        tests['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "        tests['Article has \"body\" property'] = article.hasOwnProperty('body');",
+-                  "        tests['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "        tests['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "        tests['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "        tests['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "        tests['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "        tests['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "        tests['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "        tests['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "        tests['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "        tests['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "        tests['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  "    } else {",
+-                  "        tests['articlesCount is 0 when feed is empty'] = responseJSON.articlesCount === 0;",
+-                  "    }",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles?author={{USERNAME}}",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles"
+-              ],
+-              "query": [
+-                {
+-                  "key": "author",
+-                  "value": "{{USERNAME}}"
+-                }
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Single Article by slug",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "tests['Response contains \"article\" property'] = responseJSON.hasOwnProperty('article');",
+-                  "",
+-                  "var article = responseJSON.article || {};",
+-                  "",
+-                  "tests['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "tests['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "tests['Article has \"body\" property'] = article.hasOwnProperty('body');",
+-                  "tests['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "tests['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "tests['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "tests['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "tests['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "tests['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "tests['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "tests['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "tests['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "tests['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "tests['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles/{{slug}}",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles",
+-                "{{slug}}"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Articles by Tag",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "tests['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "    tests['Response contains \"articles\" property'] = responseJSON.hasOwnProperty('articles');",
+-                  "    tests['Response contains \"articlesCount\" property'] = responseJSON.hasOwnProperty('articlesCount');",
+-                  "    tests['articlesCount is an integer'] = Number.isInteger(responseJSON.articlesCount);",
+-                  "    var article = responseJSON.articles[0];",
+-                  "    tests['An article was returned'] = article !== undefined;",
+-                  "    tests['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "    tests['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "    tests['Article has \"body\" property'] = article.hasOwnProperty('body');",
+-                  "    tests['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "    tests['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "    tests['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "    tests['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "    tests['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "    tests['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "    tests['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "    tests['The first tag is dragons'] = article.tagList[0] === 'dragons';",
+-                  "    tests['The second tag is training'] = article.tagList[1] === 'training';",
+-                  "    tests['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "    tests['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "    tests['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "    tests['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles?tag=dragons",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles"
+-              ],
+-              "query": [
+-                {
+-                  "key": "tag",
+-                  "value": "dragons"
+-                }
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Update Article",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "if (!(environment.isIntegrationTest)) {",
+-                  "var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "tests['Response contains \"article\" property'] = responseJSON.hasOwnProperty('article');",
+-                  "",
+-                  "var article = responseJSON.article || {};",
+-                  "",
+-                  "tests['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "tests['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "tests['Article has \"body\" property'] = article.hasOwnProperty('body');",
+-                  "tests['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "tests['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "tests['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "tests['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "tests['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "tests['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "tests['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "tests['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "tests['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "tests['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "tests['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "PUT",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": "{\"article\":{\"body\":\"With two hands\"}}"
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles/{{slug}}",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles",
+-                "{{slug}}"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Favorite Article",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "tests['Response contains \"article\" property'] = responseJSON.hasOwnProperty('article');",
+-                  "",
+-                  "var article = responseJSON.article || {};",
+-                  "",
+-                  "tests['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "tests['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "tests['Article has \"body\" property'] = article.hasOwnProperty('body');",
+-                  "tests['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "tests['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "tests['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "tests['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "tests['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "tests['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "tests['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "tests['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "tests['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "tests[\"Article's 'favorited' property is true\"] = article.favorited === true;",
+-                  "tests['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "tests['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  "tests[\"Article's 'favoritesCount' property is greater than 0\"] = article.favoritesCount > 0;",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "POST",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles/{{slug}}/favorite",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles",
+-                "{{slug}}",
+-                "favorite"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Articles Favorited by Username",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "tests['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "    article = responseJSON.articles[0];",
+-                  "    tests['Response contains \"articles\" property'] = responseJSON.hasOwnProperty('articles');",
+-                  "    tests['Response contains \"articlesCount\" property'] = responseJSON.hasOwnProperty('articlesCount');",
+-                  "    tests['articlesCount is an integer'] = Number.isInteger(responseJSON.articlesCount);",
+-                  "    tests['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "    tests['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "    tests['Article has \"body\" property'] = article.hasOwnProperty('body');",
+-                  "    tests['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "    tests['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "    tests['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "    tests['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "    tests['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "    tests['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "    tests['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "    tests['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "    tests['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "    tests['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "    tests['favoritesCount is 1'] = article.favoritesCount === 1;",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles?favorited={{USERNAME}}",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles"
+-              ],
+-              "query": [
+-                {
+-                  "key": "favorited",
+-                  "value": "{{USERNAME}}"
+-                }
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Articles Favorited by Username with auth",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "tests['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "    article = responseJSON.articles[0];",
+-                  "    tests['Response contains \"articles\" property'] = responseJSON.hasOwnProperty('articles');",
+-                  "    tests['Response contains \"articlesCount\" property'] = responseJSON.hasOwnProperty('articlesCount');",
+-                  "    tests['articlesCount is an integer'] = Number.isInteger(responseJSON.articlesCount);",
+-                  "    tests['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "    tests['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "    tests['Article has \"body\" property'] = article.hasOwnProperty('body');",
+-                  "    tests['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "    tests['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "    tests['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "    tests['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "    tests['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "    tests['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "    tests['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "    tests['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "    tests['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "    tests['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "    tests['favoritesCount is 1'] = article.favoritesCount === 1;",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles?favorited={{USERNAME}}",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles"
+-              ],
+-              "query": [
+-                {
+-                  "key": "favorited",
+-                  "value": "{{USERNAME}}"
+-                }
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Unfavorite Article",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "tests['Response contains \"article\" property'] = responseJSON.hasOwnProperty('article');",
+-                  "",
+-                  "var article = responseJSON.article || {};",
+-                  "",
+-                  "tests['Article has \"title\" property'] = article.hasOwnProperty('title');",
+-                  "tests['Article has \"slug\" property'] = article.hasOwnProperty('slug');",
+-                  "tests['Article has \"body\" property'] = article.hasOwnProperty('body');",
+-                  "tests['Article has \"createdAt\" property'] = article.hasOwnProperty('createdAt');",
+-                  "tests['Article\\'s \"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.createdAt);",
+-                  "tests['Article has \"updatedAt\" property'] = article.hasOwnProperty('updatedAt');",
+-                  "tests['Article\\'s \"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(article.updatedAt);",
+-                  "tests['Article has \"description\" property'] = article.hasOwnProperty('description');",
+-                  "tests['Article has \"tagList\" property'] = article.hasOwnProperty('tagList');",
+-                  "tests['Article\\'s \"tagList\" property is an Array'] = Array.isArray(article.tagList);",
+-                  "tests['Article has \"author\" property'] = article.hasOwnProperty('author');",
+-                  "tests['Article has \"favorited\" property'] = article.hasOwnProperty('favorited');",
+-                  "tests['Article has \"favoritesCount\" property'] = article.hasOwnProperty('favoritesCount');",
+-                  "tests['favoritesCount is an integer'] = Number.isInteger(article.favoritesCount);",
+-                  "tests[\"Article's \\\"favorited\\\" property is false\"] = article.favorited === false;",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "DELETE",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles/{{slug}}/favorite",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles",
+-                "{{slug}}",
+-                "favorite"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Create Comment for Article",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "id": "9f90c364-cc68-4728-961a-85eb00197d7b",
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "tests['Response contains \"comment\" property'] = responseJSON.hasOwnProperty('comment');",
+-                  "",
+-                  "var comment = responseJSON.comment || {};",
+-                  "",
+-                  "tests['Comment has \"id\" property'] = comment.hasOwnProperty('id');",
+-                  "pm.globals.set('commentId', comment.id);",
+-                  "",
+-                  "tests['Comment has \"body\" property'] = comment.hasOwnProperty('body');",
+-                  "tests['Comment has \"createdAt\" property'] = comment.hasOwnProperty('createdAt');",
+-                  "tests['\"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(comment.createdAt);",
+-                  "tests['Comment has \"updatedAt\" property'] = comment.hasOwnProperty('updatedAt');",
+-                  "tests['\"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(comment.updatedAt);",
+-                  "tests['Comment has \"author\" property'] = comment.hasOwnProperty('author');",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "POST",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": "{\"comment\":{\"body\":\"Thank you so much!\"}}"
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles/{{slug}}/comments",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles",
+-                "{{slug}}",
+-                "comments"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "All Comments for Article",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200",
+-                  "",
+-                  "tests['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "    tests['Response contains \"comments\" property'] = responseJSON.hasOwnProperty('comments');",
+-                  "",
+-                  "    if(responseJSON.comments.length){",
+-                  "        var comment = responseJSON.comments[0];",
+-                  "",
+-                  "        tests['Comment has \"id\" property'] = comment.hasOwnProperty('id');",
+-                  "        tests['Comment has \"body\" property'] = comment.hasOwnProperty('body');",
+-                  "        tests['Comment has \"createdAt\" property'] = comment.hasOwnProperty('createdAt');",
+-                  "        tests['\"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(comment.createdAt);",
+-                  "        tests['Comment has \"updatedAt\" property'] = comment.hasOwnProperty('updatedAt');",
+-                  "        tests['\"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(comment.updatedAt);",
+-                  "        tests['Comment has \"author\" property'] = comment.hasOwnProperty('author');",
+-                  "    }",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles/{{slug}}/comments",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles",
+-                "{{slug}}",
+-                "comments"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "All Comments for Article without login",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200",
+-                  "",
+-                  "tests['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "    tests['Response contains \"comments\" property'] = responseJSON.hasOwnProperty('comments');",
+-                  "",
+-                  "    if(responseJSON.comments.length){",
+-                  "        var comment = responseJSON.comments[0];",
+-                  "",
+-                  "        tests['Comment has \"id\" property'] = comment.hasOwnProperty('id');",
+-                  "        tests['Comment has \"body\" property'] = comment.hasOwnProperty('body');",
+-                  "        tests['Comment has \"createdAt\" property'] = comment.hasOwnProperty('createdAt');",
+-                  "        tests['\"createdAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(comment.createdAt);",
+-                  "        tests['Comment has \"updatedAt\" property'] = comment.hasOwnProperty('updatedAt');",
+-                  "        tests['\"updatedAt\" property is an ISO 8601 timestamp'] = /^\\d{4,}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d.\\d+(?:[+-][0-2]\\d:[0-5]\\d|Z)$/.test(comment.updatedAt);",
+-                  "        tests['Comment has \"author\" property'] = comment.hasOwnProperty('author');",
+-                  "    }",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles/{{slug}}/comments",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles",
+-                "{{slug}}",
+-                "comments"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Delete Comment for Article",
+-          "request": {
+-            "method": "DELETE",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles/{{slug}}/comments/{{commentId}}",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles",
+-                "{{slug}}",
+-                "comments",
+-                "{{commentId}}"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Delete Article",
+-          "request": {
+-            "method": "DELETE",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/articles/{{slug}}",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "articles",
+-                "{{slug}}"
+-              ]
+-            }
+-          },
+-          "response": []
+-        }
+-      ],
+-      "event": [
+-        {
+-          "listen": "prerequest",
+-          "script": {
+-            "id": "67853a4a-e972-4573-a295-dad12a46a9d7",
+-            "type": "text/javascript",
+-            "exec": [
+-              ""
+-            ]
+-          }
+-        },
+-        {
+-          "listen": "test",
+-          "script": {
+-            "id": "3057f989-15e4-484e-b8fa-a041043d0ac0",
+-            "type": "text/javascript",
+-            "exec": [
+-              ""
+-            ]
+-          }
+-        }
+-      ]
+-    },
+-    {
+-      "name": "Profiles",
+-      "item": [
+-        {
+-          "name": "Register Celeb",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "if (!(environment.isIntegrationTest)) {",
+-                  "var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "tests['Response contains \"user\" property'] = responseJSON.hasOwnProperty('user');",
+-                  "",
+-                  "var user = responseJSON.user || {};",
+-                  "",
+-                  "tests['User has \"email\" property'] = user.hasOwnProperty('email');",
+-                  "tests['User has \"username\" property'] = user.hasOwnProperty('username');",
+-                  "tests['User has \"bio\" property'] = user.hasOwnProperty('bio');",
+-                  "tests['User has \"image\" property'] = user.hasOwnProperty('image');",
+-                  "tests['User has \"token\" property'] = user.hasOwnProperty('token');",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "POST",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": "{\"user\":{\"email\":\"celeb_{{EMAIL}}\", \"password\":\"{{PASSWORD}}\", \"username\":\"celeb_{{USERNAME}}\"}}"
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/users",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "users"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Profile",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "if (!(environment.isIntegrationTest)) {",
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "tests['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "    tests['Response contains \"profile\" property'] = responseJSON.hasOwnProperty('profile');",
+-                  "    ",
+-                  "    var profile = responseJSON.profile || {};",
+-                  "    ",
+-                  "    tests['Profile has \"username\" property'] = profile.hasOwnProperty('username');",
+-                  "    tests['Profile has \"bio\" property'] = profile.hasOwnProperty('bio');",
+-                  "    tests['Profile has \"image\" property'] = profile.hasOwnProperty('image');",
+-                  "    tests['Profile has \"following\" property'] = profile.hasOwnProperty('following');",
+-                  "}",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/profiles/celeb_{{USERNAME}}",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "profiles",
+-                "celeb_{{USERNAME}}"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Follow Profile",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "if (!(environment.isIntegrationTest)) {",
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "tests['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "    tests['Response contains \"profile\" property'] = responseJSON.hasOwnProperty('profile');",
+-                  "    ",
+-                  "    var profile = responseJSON.profile || {};",
+-                  "    ",
+-                  "    tests['Profile has \"username\" property'] = profile.hasOwnProperty('username');",
+-                  "    tests['Profile has \"bio\" property'] = profile.hasOwnProperty('bio');",
+-                  "    tests['Profile has \"image\" property'] = profile.hasOwnProperty('image');",
+-                  "    tests['Profile has \"following\" property'] = profile.hasOwnProperty('following');",
+-                  "    tests['Profile\\'s \"following\" property is true'] = profile.following === true;",
+-                  "}",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "POST",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": "{\"user\":{\"email\":\"{{EMAIL}}\"}}"
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/profiles/celeb_{{USERNAME}}/follow",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "profiles",
+-                "celeb_{{USERNAME}}",
+-                "follow"
+-              ]
+-            }
+-          },
+-          "response": []
+-        },
+-        {
+-          "name": "Unfollow Profile",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "if (!(environment.isIntegrationTest)) {",
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "tests['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "",
+-                  "    tests['Response contains \"profile\" property'] = responseJSON.hasOwnProperty('profile');",
+-                  "    ",
+-                  "    var profile = responseJSON.profile || {};",
+-                  "    ",
+-                  "    tests['Profile has \"username\" property'] = profile.hasOwnProperty('username');",
+-                  "    tests['Profile has \"bio\" property'] = profile.hasOwnProperty('bio');",
+-                  "    tests['Profile has \"image\" property'] = profile.hasOwnProperty('image');",
+-                  "    tests['Profile has \"following\" property'] = profile.hasOwnProperty('following');",
+-                  "    tests['Profile\\'s \"following\" property is false'] = profile.following === false;",
+-                  "}",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "DELETE",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              },
+-              {
+-                "key": "Authorization",
+-                "value": "Token {{token}}"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/profiles/celeb_{{USERNAME}}/follow",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "profiles",
+-                "celeb_{{USERNAME}}",
+-                "follow"
+-              ]
+-            }
+-          },
+-          "response": []
+-        }
+-      ]
+-    },
+-    {
+-      "name": "Tags",
+-      "item": [
+-        {
+-          "name": "All Tags",
+-          "event": [
+-            {
+-              "listen": "test",
+-              "script": {
+-                "type": "text/javascript",
+-                "exec": [
+-                  "var is200Response = responseCode.code === 200;",
+-                  "",
+-                  "tests['Response code is 200 OK'] = is200Response;",
+-                  "",
+-                  "if(is200Response){",
+-                  "    var responseJSON = JSON.parse(responseBody);",
+-                  "    ",
+-                  "    tests['Response contains \"tags\" property'] = responseJSON.hasOwnProperty('tags');",
+-                  "    tests['\"tags\" property returned as array'] = Array.isArray(responseJSON.tags);",
+-                  "}",
+-                  ""
+-                ]
+-              }
+-            }
+-          ],
+-          "request": {
+-            "method": "GET",
+-            "header": [
+-              {
+-                "key": "Content-Type",
+-                "value": "application/json"
+-              },
+-              {
+-                "key": "X-Requested-With",
+-                "value": "XMLHttpRequest"
+-              }
+-            ],
+-            "body": {
+-              "mode": "raw",
+-              "raw": ""
+-            },
+-            "url": {
+-              "raw": "{{APIURL}}/tags",
+-              "host": [
+-                "{{APIURL}}"
+-              ],
+-              "path": [
+-                "tags"
+-              ]
+-            }
+-          },
+-          "response": []
+-        }
+-      ]
+-    }
+-  ]
+-}
+diff --git a/postman/run-api-tests.sh b/postman/run-api-tests.sh
+deleted file mode 100755
+index c546e88..0000000
+--- a/postman/run-api-tests.sh
++++ /dev/null
+@@ -1,17 +0,0 @@
+-#!/usr/bin/env bash
+-set -x
+-
+-SCRIPTDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null && pwd )"
+-
+-APIURL=${APIURL:-https://api.realworld.io/api}
+-USERNAME=${USERNAME:-u`date +%s`}
+-EMAIL=${EMAIL:-$USERNAME@mail.com}
+-PASSWORD=${PASSWORD:-password}
+-
+-npx newman run $SCRIPTDIR/Conduit.postman_collection.json \
+-  --delay-request 500 \
+-  --global-var "APIURL=$APIURL" \
+-  --global-var "USERNAME=$USERNAME" \
+-  --global-var "EMAIL=$EMAIL" \
+-  --global-var "PASSWORD=$PASSWORD" \
+-  "$@"
+diff --git a/tests/__init__.py b/tests/__init__.py
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/tests/api/__init__.py b/tests/api/__init__.py
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/tests/api/routes/__init__.py b/tests/api/routes/__init__.py
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/tests/api/routes/test_article.py b/tests/api/routes/test_article.py
+deleted file mode 100644
+index 533c266..0000000
+--- a/tests/api/routes/test_article.py
++++ /dev/null
+@@ -1,201 +0,0 @@
+-import pytest
+-from httpx import AsyncClient
+-from sqlalchemy.ext.asyncio import AsyncSession
+-
+-from conduit.api.schemas.responses.article import ArticleResponse
+-from conduit.dtos.domain.article import ArticleDTO
+-from conduit.infrastructure.repositories.article import ArticleRepository
+-from conduit.interfaces.services.user import IUserService
+-from tests.utils import create_another_test_article, create_another_test_user
+-
+-
+-@pytest.mark.anyio
+-async def test_user_can_create_new_article(authorized_test_client: AsyncClient) -> None:
+-    payload = {
+-        "article": {
+-            "title": "Test Article",
+-            "body": "test body content",
+-            "description": "test description",
+-            "tagList": ["tag1", "tag2", "tag3"],
+-        }
+-    }
+-    response = await authorized_test_client.post(url="/articles", json=payload)
+-    assert response.status_code == 200
+-
+-
+-@pytest.mark.anyio
+-async def test_user_can_create_article_without_tags(
+-    authorized_test_client: AsyncClient, test_article: ArticleDTO
+-) -> None:
+-    payload = {
+-        "article": {
+-            "title": "Test Article",
+-            "body": "test body content",
+-            "description": "test description",
+-            "tagList": [],
+-        }
+-    }
+-    response = await authorized_test_client.post(url="/articles", json=payload)
+-    assert response.status_code == 200
+-
+-
+-@pytest.mark.anyio
+-async def test_user_can_create_article_without_duplicated_tags(
+-    authorized_test_client: AsyncClient,
+-) -> None:
+-    payload = {
+-        "article": {
+-            "title": "Test Article",
+-            "body": "test body content",
+-            "description": "test description",
+-            "tagList": ["tag1", "tag2", "tag2", "tag3", "tag3"],
+-        }
+-    }
+-    response = await authorized_test_client.post(url="/articles", json=payload)
+-    article = ArticleResponse(**response.json())
+-    assert set(article.article.tags) == {"tag1", "tag2", "tag3"}
+-
+-
+-@pytest.mark.anyio
+-async def test_user_can_create_article_with_existing_title(
+-    authorized_test_client: AsyncClient, test_article: ArticleDTO
+-) -> None:
+-    payload = {
+-        "article": {
+-            "title": test_article.title,
+-            "body": "test body content",
+-            "description": "test description",
+-            "tagList": test_article.tags,
+-        }
+-    }
+-    response = await authorized_test_client.post(url="/articles", json=payload)
+-    assert response.status_code == 200
+-
+-
+-@pytest.mark.anyio
+-async def test_user_can_retrieve_article_without_tags(
+-    authorized_test_client: AsyncClient,
+-) -> None:
+-    payload = {
+-        "article": {
+-            "title": "Test Article",
+-            "body": "test body content",
+-            "description": "test description",
+-            "tagList": [],
+-        }
+-    }
+-    response = await authorized_test_client.post(url="/articles", json=payload)
+-    assert response.status_code == 200
+-
+-    article = ArticleResponse(**response.json())
+-    response = await authorized_test_client.get(url=f"/articles/{article.article.slug}")
+-    assert response.status_code == 200
+-
+-
+-@pytest.mark.anyio
+-async def test_user_can_not_retrieve_not_existing_article(
+-    authorized_test_client: AsyncClient,
+-) -> None:
+-    response = await authorized_test_client.get(
+-        url="/articles/not-existing-article-slug"
+-    )
+-    assert response.status_code == 404
+-
+-
+-@pytest.mark.anyio
+-async def test_user_can_retrieve_article_if_exists(
+-    authorized_test_client: AsyncClient, test_article: ArticleDTO
+-) -> None:
+-    response = await authorized_test_client.get(url=f"/articles/{test_article.slug}")
+-    article = ArticleResponse(**response.json())
+-    assert article.article.slug == test_article.slug
+-    assert article.article.description == test_article.description
+-    assert article.article.body == test_article.body
+-
+-
+-@pytest.mark.anyio
+-async def test_user_can_not_delete_foreign_article(
+-    authorized_test_client: AsyncClient,
+-    session: AsyncSession,
+-    user_service: IUserService,
+-    article_repository: ArticleRepository,
+-) -> None:
+-    new_user = await create_another_test_user(
+-        session=session, user_service=user_service
+-    )
+-    new_article = await create_another_test_article(
+-        session=session, article_repository=article_repository, author_id=new_user.id
+-    )
+-    response = await authorized_test_client.delete(url=f"/articles/{new_article.slug}")
+-    assert response.status_code == 403
+-
+-
+-@pytest.mark.anyio
+-async def test_user_can_not_update_foreign_article(
+-    authorized_test_client: AsyncClient,
+-    session: AsyncSession,
+-    user_service: IUserService,
+-    article_repository: ArticleRepository,
+-) -> None:
+-    new_user = await create_another_test_user(
+-        session=session, user_service=user_service
+-    )
+-    new_article = await create_another_test_article(
+-        session=session, article_repository=article_repository, author_id=new_user.id
+-    )
+-    response = await authorized_test_client.put(
+-        url=f"/articles/{new_article.slug}",
+-        json={"article": {"title": "New Updated Title"}},
+-    )
+-    assert response.status_code == 403
+-
+-
+-@pytest.mark.anyio
+-async def test_user_can_delete_own_article(
+-    authorized_test_client: AsyncClient, test_article: ArticleDTO
+-) -> None:
+-    response = await authorized_test_client.delete(url=f"/articles/{test_article.slug}")
+-    assert response.status_code == 204
+-
+-    response = await authorized_test_client.get(url=f"/articles/{test_article.slug}")
+-    assert response.status_code == 404
+-
+-
+-@pytest.mark.anyio
+-async def test_user_can_not_favorite_article_twice(
+-    authorized_test_client: AsyncClient, test_article: ArticleDTO
+-) -> None:
+-    response = await authorized_test_client.post(
+-        url=f"/articles/{test_article.slug}/favorite"
+-    )
+-    assert response.status_code == 200
+-
+-    response = await authorized_test_client.post(
+-        url=f"/articles/{test_article.slug}/favorite"
+-    )
+-    assert response.status_code == 400
+-
+-
+-@pytest.mark.anyio
+-async def test_user_can_not_unfavorite_article_without_favorite(
+-    authorized_test_client: AsyncClient, test_article: ArticleDTO
+-) -> None:
+-    response = await authorized_test_client.delete(
+-        url=f"/articles/{test_article.slug}/favorite"
+-    )
+-    assert response.status_code == 400
+-
+-
+-@pytest.mark.anyio
+-async def test_user_can_unfavorite_article_after_favorite(
+-    authorized_test_client: AsyncClient, test_article: ArticleDTO
+-) -> None:
+-    response = await authorized_test_client.post(
+-        url=f"/articles/{test_article.slug}/favorite"
+-    )
+-    assert response.status_code == 200
+-
+-    response = await authorized_test_client.delete(
+-        url=f"/articles/{test_article.slug}/favorite"
+-    )
+-    assert response.status_code == 200
+diff --git a/tests/api/routes/test_article_filters.py b/tests/api/routes/test_article_filters.py
+deleted file mode 100644
+index 77f65fa..0000000
+--- a/tests/api/routes/test_article_filters.py
++++ /dev/null
+@@ -1,183 +0,0 @@
+-import pytest
+-from httpx import AsyncClient
+-from sqlalchemy.ext.asyncio import AsyncSession
+-
+-from conduit.dtos.domain.article import CreateArticleDTO
+-from conduit.dtos.domain.user import CreateUserDTO, UserDTO
+-from conduit.interfaces.services.article import IArticleService
+-from conduit.interfaces.services.user import IUserService
+-
+-
+-async def create_user(
+-    session: AsyncSession, user_service: IUserService, username: str
+-) -> UserDTO:
+-    return await user_service.create_user(
+-        session=session,
+-        user_to_create=CreateUserDTO(
+-            username=username,
+-            email=f"{username}@example.com",
+-            password="password",
+-        ),
+-    )
+-
+-
+-async def create_article(
+-    session: AsyncSession,
+-    article_service: IArticleService,
+-    author_id: int,
+-    title: str,
+-    tags: list[str],
+-) -> None:
+-    await article_service.create_new_article(
+-        session=session,
+-        author_id=author_id,
+-        article_to_create=CreateArticleDTO(
+-            title=title,
+-            description="description",
+-            body="body",
+-            tags=tags,
+-        ),
+-    )
+-
+-
+-@pytest.mark.anyio
+-async def test_article_filters_by_tag(
+-    test_client: AsyncClient,
+-    session: AsyncSession,
+-    user_service: IUserService,
+-    article_service: IArticleService,
+-) -> None:
+-    author = await create_user(session, user_service, "tag-author")
+-    await create_article(session, article_service, author.id, "Tagged One", ["tag-one"])
+-    await create_article(session, article_service, author.id, "Tagged Two", ["tag-two"])
+-
+-    response = await test_client.get(url="/articles", params={"tag": "tag-one"})
+-    assert response.status_code == 200
+-
+-    payload = response.json()
+-    assert payload["articlesCount"] == 1
+-    assert payload["articles"][0]["title"] == "Tagged One"
+-    assert "tag-one" in payload["articles"][0]["tagList"]
+-
+-
+-@pytest.mark.anyio
+-async def test_article_filters_by_author(
+-    test_client: AsyncClient,
+-    session: AsyncSession,
+-    user_service: IUserService,
+-    article_service: IArticleService,
+-) -> None:
+-    author = await create_user(session, user_service, "author-a")
+-    another_author = await create_user(session, user_service, "author-b")
+-    await create_article(
+-        session, article_service, author.id, "Author A Article", ["tag-a"]
+-    )
+-    await create_article(
+-        session, article_service, another_author.id, "Author B Article", ["tag-b"]
+-    )
+-
+-    response = await test_client.get(
+-        url="/articles", params={"author": author.username}
+-    )
+-    assert response.status_code == 200
+-
+-    payload = response.json()
+-    assert payload["articlesCount"] == 1
+-    assert payload["articles"][0]["author"]["username"] == author.username
+-
+-
+-@pytest.mark.anyio
+-async def test_article_filters_by_favorited(
+-    authorized_test_client: AsyncClient,
+-    test_client: AsyncClient,
+-    session: AsyncSession,
+-    user_service: IUserService,
+-    article_service: IArticleService,
+-    test_user: UserDTO,
+-) -> None:
+-    author = await create_user(session, user_service, "favorite-author")
+-    await create_article(
+-        session, article_service, author.id, "Favorited Article", ["tag-f"]
+-    )
+-    await create_article(
+-        session, article_service, author.id, "Not Favorited", ["tag-f"]
+-    )
+-
+-    response = await test_client.get(url="/articles")
+-    articles = response.json()["articles"]
+-    favorited_article = next(
+-        article for article in articles if article["title"] == "Favorited Article"
+-    )
+-    slug = favorited_article["slug"]
+-    await authorized_test_client.post(url=f"/articles/{slug}/favorite")
+-
+-    response = await authorized_test_client.get(
+-        url="/articles", params={"favorited": test_user.username}
+-    )
+-    assert response.status_code == 200
+-
+-    payload = response.json()
+-    assert payload["articlesCount"] == 1
+-    assert payload["articles"][0]["favorited"] is True
+-
+-
+-@pytest.mark.anyio
+-async def test_articles_pagination_limit_and_offset(
+-    test_client: AsyncClient,
+-    session: AsyncSession,
+-    user_service: IUserService,
+-    article_service: IArticleService,
+-) -> None:
+-    author = await create_user(session, user_service, "pagination-author")
+-    await create_article(session, article_service, author.id, "Article One", ["tag-p"])
+-    await create_article(session, article_service, author.id, "Article Two", ["tag-p"])
+-
+-    response = await test_client.get(url="/articles", params={"limit": 1, "offset": 0})
+-    assert response.status_code == 200
+-    payload = response.json()
+-    assert payload["articlesCount"] == 2
+-    assert len(payload["articles"]) == 1
+-    first_slug = payload["articles"][0]["slug"]
+-
+-    response = await test_client.get(url="/articles", params={"limit": 1, "offset": 1})
+-    assert response.status_code == 200
+-    payload = response.json()
+-    assert payload["articlesCount"] == 2
+-    assert len(payload["articles"]) == 1
+-    assert payload["articles"][0]["slug"] != first_slug
+-
+-
+-@pytest.mark.anyio
+-async def test_user_feed_returns_followed_articles_only(
+-    authorized_test_client: AsyncClient,
+-    session: AsyncSession,
+-    user_service: IUserService,
+-    article_service: IArticleService,
+-) -> None:
+-    followed_author = await create_user(session, user_service, "followed-author")
+-    unfollowed_author = await create_user(session, user_service, "unfollowed-author")
+-    await create_article(
+-        session,
+-        article_service,
+-        followed_author.id,
+-        "Followed Article",
+-        ["tag-feed"],
+-    )
+-    await create_article(
+-        session,
+-        article_service,
+-        unfollowed_author.id,
+-        "Unfollowed Article",
+-        ["tag-feed"],
+-    )
+-
+-    response = await authorized_test_client.post(
+-        url=f"/profiles/{followed_author.username}/follow"
+-    )
+-    assert response.status_code == 200
+-
+-    response = await authorized_test_client.get(url="/articles/feed")
+-    assert response.status_code == 200
+-    payload = response.json()
+-    assert payload["articlesCount"] == 1
+-    assert payload["articles"][0]["author"]["username"] == followed_author.username
+diff --git a/tests/api/routes/test_article_integrity.py b/tests/api/routes/test_article_integrity.py
+deleted file mode 100644
+index 0784004..0000000
+--- a/tests/api/routes/test_article_integrity.py
++++ /dev/null
+@@ -1,33 +0,0 @@
+-import pytest
+-from httpx import AsyncClient
+-
+-from conduit.dtos.domain.article import ArticleDTO
+-
+-
+-@pytest.mark.anyio
+-async def test_article_delete_removes_access_to_comments_and_favorites(
+-    authorized_test_client: AsyncClient, test_article: ArticleDTO
+-) -> None:
+-    comment_payload = {"comment": {"body": "test comment"}}
+-    response = await authorized_test_client.post(
+-        url=f"/articles/{test_article.slug}/comments", json=comment_payload
+-    )
+-    assert response.status_code == 200
+-
+-    response = await authorized_test_client.post(
+-        url=f"/articles/{test_article.slug}/favorite"
+-    )
+-    assert response.status_code == 200
+-
+-    response = await authorized_test_client.delete(url=f"/articles/{test_article.slug}")
+-    assert response.status_code == 204
+-
+-    response = await authorized_test_client.get(
+-        url=f"/articles/{test_article.slug}/comments"
+-    )
+-    assert response.status_code == 404
+-
+-    response = await authorized_test_client.delete(
+-        url=f"/articles/{test_article.slug}/favorite"
+-    )
+-    assert response.status_code == 404
+diff --git a/tests/api/routes/test_auth_permissions.py b/tests/api/routes/test_auth_permissions.py
+deleted file mode 100644
+index 9ee773b..0000000
+--- a/tests/api/routes/test_auth_permissions.py
++++ /dev/null
+@@ -1,47 +0,0 @@
+-import pytest
+-from httpx import AsyncClient
+-
+-from conduit.dtos.domain.article import ArticleDTO
+-
+-
+-@pytest.mark.anyio
+-async def test_user_can_not_create_article_without_auth(
+-    test_client: AsyncClient,
+-) -> None:
+-    payload = {
+-        "article": {
+-            "title": "Test Article",
+-            "body": "test body content",
+-            "description": "test description",
+-            "tagList": ["tag1", "tag2"],
+-        }
+-    }
+-    response = await test_client.post(url="/articles", json=payload)
+-    assert response.status_code == 403
+-
+-
+-@pytest.mark.anyio
+-async def test_user_can_not_favorite_article_without_auth(
+-    test_client: AsyncClient, test_article: ArticleDTO
+-) -> None:
+-    response = await test_client.post(url=f"/articles/{test_article.slug}/favorite")
+-    assert response.status_code == 403
+-
+-
+-@pytest.mark.anyio
+-async def test_user_can_not_comment_without_auth(
+-    test_client: AsyncClient, test_article: ArticleDTO
+-) -> None:
+-    payload = {"comment": {"body": "Test comment"}}
+-    response = await test_client.post(
+-        url=f"/articles/{test_article.slug}/comments", json=payload
+-    )
+-    assert response.status_code == 403
+-
+-
+-@pytest.mark.anyio
+-async def test_user_can_not_use_invalid_jwt_token(test_client: AsyncClient) -> None:
+-    response = await test_client.get(
+-        url="/user", headers={"Authorization": "Token invalid.jwt.token"}
+-    )
+-    assert response.status_code == 403
+diff --git a/tests/api/routes/test_health_check.py b/tests/api/routes/test_health_check.py
+deleted file mode 100644
+index c37fb94..0000000
+--- a/tests/api/routes/test_health_check.py
++++ /dev/null
+@@ -1,11 +0,0 @@
+-import pytest
+-from httpx import AsyncClient
+-
+-
+-@pytest.mark.anyio
+-async def test_successful_health_check(test_client: AsyncClient) -> None:
+-    response = await test_client.get("/health-check")
+-    assert response.status_code == 200
+-
+-    response = response.json()
+-    assert response["message"] == "Conduit Realworld API"
+diff --git a/tests/api/routes/test_login.py b/tests/api/routes/test_login.py
+deleted file mode 100644
+index 5597b14..0000000
+--- a/tests/api/routes/test_login.py
++++ /dev/null
+@@ -1,29 +0,0 @@
+-import pytest
+-from httpx import AsyncClient
+-
+-from conduit.dtos.domain.user import UserDTO
+-
+-
+-@pytest.mark.anyio
+-async def test_user_successful_login(
+-    test_client: AsyncClient, test_user: UserDTO
+-) -> None:
+-    payload = {"user": {"email": "test@gmail.com", "password": "password"}}
+-    response = await test_client.post("/users/login", json=payload)
+-    assert response.status_code == 200
+-
+-
+-@pytest.mark.parametrize(
+-    "credentials,",
+-    (
+-        {"email": "invalid@gmail.com", "password": "password"},
+-        {"email": "test@gmail.com", "password": "invalidpassword"},
+-    ),
+-)
+-@pytest.mark.anyio
+-async def test_user_login_with_invalid_credentials_part(
+-    test_client: AsyncClient, credentials: dict
+-) -> None:
+-    payload = {"user": credentials}
+-    response = await test_client.post("/users/login", json=payload)
+-    assert response.status_code == 400
+diff --git a/tests/api/routes/test_profile.py b/tests/api/routes/test_profile.py
+deleted file mode 100644
+index 4ad9982..0000000
+--- a/tests/api/routes/test_profile.py
++++ /dev/null
+@@ -1,167 +0,0 @@
+-import pytest
+-from httpx import AsyncClient
+-from sqlalchemy.ext.asyncio import AsyncSession
+-
+-from conduit.api.schemas.responses.profile import ProfileResponse
+-from conduit.dtos.domain.user import UserDTO
+-from conduit.interfaces.services.user import IUserService
+-from tests.utils import create_another_test_user
+-
+-
+-@pytest.mark.anyio
+-async def test_not_authenticated_user_can_get_profile(
+-    test_client: AsyncClient, test_user: UserDTO
+-) -> None:
+-    response = await test_client.get(url=f"/profiles/{test_user.username}")
+-    profile = ProfileResponse(**response.json())
+-    assert profile.profile.username == test_user.username
+-    assert not profile.profile.following
+-
+-
+-@pytest.mark.anyio
+-async def test_authenticated_user_can_get_own_profile(
+-    authorized_test_client: AsyncClient, test_user: UserDTO
+-) -> None:
+-    response = await authorized_test_client.get(url=f"/profiles/{test_user.username}")
+-    profile = ProfileResponse(**response.json())
+-    assert profile.profile.username == test_user.username
+-    assert not profile.profile.following
+-
+-
+-@pytest.mark.anyio
+-async def test_not_authenticated_user_can_not_follow_another_user_profile(
+-    test_client: AsyncClient, test_user: UserDTO
+-) -> None:
+-    response = await test_client.post(url=f"/profiles/{test_user.username}/follow")
+-    assert response.status_code == 403
+-
+-
+-@pytest.mark.anyio
+-async def test_authenticated_user_cant_follow_own_profile(
+-    authorized_test_client: AsyncClient, test_user: UserDTO
+-) -> None:
+-    response = await authorized_test_client.post(
+-        url=f"/profiles/{test_user.username}/follow"
+-    )
+-    assert response.status_code == 403
+-
+-
+-@pytest.mark.anyio
+-async def test_authenticated_user_cant_follow_another_profile(
+-    authorized_test_client: AsyncClient,
+-    test_user: UserDTO,
+-    user_service: IUserService,
+-    session: AsyncSession,
+-) -> None:
+-    new_user = await create_another_test_user(
+-        session=session, user_service=user_service
+-    )
+-    response = await authorized_test_client.post(
+-        url=f"/profiles/{new_user.username}/follow"
+-    )
+-    assert response.status_code == 200
+-    assert response.json()["profile"]["following"] is True
+-
+-
+-@pytest.mark.anyio
+-async def test_authenticated_user_cant_follow_already_followed_profile(
+-    authorized_test_client: AsyncClient,
+-    test_user: UserDTO,
+-    user_service: IUserService,
+-    session: AsyncSession,
+-) -> None:
+-    new_user = await create_another_test_user(
+-        session=session, user_service=user_service
+-    )
+-    response = await authorized_test_client.post(
+-        url=f"/profiles/{new_user.username}/follow"
+-    )
+-    assert response.status_code == 200
+-    assert response.json()["profile"]["following"] is True
+-
+-    response = await authorized_test_client.post(
+-        url=f"/profiles/{new_user.username}/follow"
+-    )
+-    assert response.status_code == 400
+-
+-
+-@pytest.mark.anyio
+-async def test_authenticated_user_cant_unfollow_not_followed_profile(
+-    authorized_test_client: AsyncClient,
+-    user_service: IUserService,
+-    session: AsyncSession,
+-) -> None:
+-    new_user = await create_another_test_user(
+-        session=session, user_service=user_service
+-    )
+-    response = await authorized_test_client.delete(
+-        url=f"/profiles/{new_user.username}/follow"
+-    )
+-    assert response.status_code == 400
+-
+-
+-@pytest.mark.anyio
+-async def test_authenticated_user_can_unfollow_followed_profile(
+-    authorized_test_client: AsyncClient,
+-    user_service: IUserService,
+-    session: AsyncSession,
+-) -> None:
+-    new_user = await create_another_test_user(
+-        session=session, user_service=user_service
+-    )
+-    response = await authorized_test_client.post(
+-        url=f"/profiles/{new_user.username}/follow"
+-    )
+-    assert response.status_code == 200
+-    assert response.json()["profile"]["following"] is True
+-
+-    response = await authorized_test_client.delete(
+-        url=f"/profiles/{new_user.username}/follow"
+-    )
+-    assert response.status_code == 200
+-    assert response.json()["profile"]["following"] is False
+-
+-
+-@pytest.mark.anyio
+-async def test_authenticated_user_can_unfollow_already_unfollowed_profile(
+-    authorized_test_client: AsyncClient,
+-    user_service: IUserService,
+-    session: AsyncSession,
+-) -> None:
+-    new_user = await create_another_test_user(
+-        session=session, user_service=user_service
+-    )
+-    response = await authorized_test_client.post(
+-        url=f"/profiles/{new_user.username}/follow"
+-    )
+-    assert response.status_code == 200
+-    assert response.json()["profile"]["following"] is True
+-
+-    response = await authorized_test_client.delete(
+-        url=f"/profiles/{new_user.username}/follow"
+-    )
+-    assert response.status_code == 200
+-    assert response.json()["profile"]["following"] is False
+-
+-    response = await authorized_test_client.delete(
+-        url=f"/profiles/{new_user.username}/follow"
+-    )
+-    assert response.status_code == 400
+-
+-
+-@pytest.mark.parametrize(
+-    "api_method, api_path",
+-    (
+-        ("GET", "/profiles/{username}"),
+-        ("POST", "/profiles/{username}/follow"),
+-        ("DELETE", "/profiles/{username}/follow"),
+-    ),
+-)
+-@pytest.mark.anyio
+-async def test_user_can_not_retrieve_not_existing_profile(
+-    authorized_test_client: AsyncClient, api_method: str, api_path: str
+-) -> None:
+-    response = await authorized_test_client.request(
+-        method=api_method, url=api_path.format(username="not-existing-username")
+-    )
+-    assert response.status_code == 404
+diff --git a/tests/api/routes/test_registaration.py b/tests/api/routes/test_registaration.py
+deleted file mode 100644
+index 6c49b68..0000000
+--- a/tests/api/routes/test_registaration.py
++++ /dev/null
+@@ -1,37 +0,0 @@
+-import pytest
+-from httpx import AsyncClient
+-from sqlalchemy.ext.asyncio import AsyncSession
+-
+-from conduit.dtos.domain.user import UserDTO
+-from conduit.infrastructure.repositories.user import UserRepository
+-from conduit.services.password import verify_password
+-
+-
+-@pytest.mark.anyio
+-async def test_user_success_registration(
+-    test_client: AsyncClient, session: AsyncSession, user_repository: UserRepository
+-) -> None:
+-    email, username, password = ("success@gmail.com", "success", "password")
+-    payload = {"user": {"email": email, "username": username, "password": password}}
+-    response = await test_client.post("/users", json=payload)
+-    assert response.status_code == 200
+-
+-    user = await user_repository.get_by_email(session=session, email=email)
+-    assert user.email == email
+-    assert user.username == username
+-    assert verify_password(plain_password=password, hashed_password=user.password_hash)
+-
+-
+-@pytest.mark.parametrize(
+-    "field, value", (("username", "new_username"), ("email", "new-email@gmail.com"))
+-)
+-@pytest.mark.anyio
+-async def test_user_registration_with_taken_credentials(
+-    test_client: AsyncClient, test_user: UserDTO, field: str, value: str
+-) -> None:
+-    payload = {
+-        "user": {"email": "test@gmail.com", "username": "test", "password": "password"}
+-    }
+-    payload["user"][field] = value
+-    response = await test_client.post("/users", json=payload)
+-    assert response.status_code == 400
+diff --git a/tests/api/routes/test_tags.py b/tests/api/routes/test_tags.py
+deleted file mode 100644
+index 26cc1ad..0000000
+--- a/tests/api/routes/test_tags.py
++++ /dev/null
+@@ -1,20 +0,0 @@
+-import pytest
+-from httpx import AsyncClient
+-
+-from conduit.dtos.domain.article import ArticleDTO
+-
+-
+-@pytest.mark.anyio
+-async def test_empty_list_when_no_tags_exist(test_client: AsyncClient) -> None:
+-    response = await test_client.get(url="/tags")
+-    assert response.json() == {"tags": []}
+-
+-
+-@pytest.mark.anyio
+-async def test_list_of_tags_when_article_with_tags_exists(
+-    authorized_test_client: AsyncClient, test_article: ArticleDTO
+-) -> None:
+-    response = await authorized_test_client.get(url="/tags")
+-    response_tags = response.json()["tags"]
+-    assert len(response_tags) == len(set(test_article.tags))
+-    assert all(tag in test_article.tags for tag in response_tags)
+diff --git a/tests/api/routes/test_user.py b/tests/api/routes/test_user.py
+deleted file mode 100644
+index 68ffe39..0000000
+--- a/tests/api/routes/test_user.py
++++ /dev/null
+@@ -1,111 +0,0 @@
+-import pytest
+-from httpx import AsyncClient
+-from sqlalchemy.ext.asyncio import AsyncSession
+-
+-from conduit.dtos.domain.user import UserDTO
+-from conduit.infrastructure.repositories.user import UserRepository
+-from conduit.services.password import verify_password
+-
+-
+-@pytest.mark.anyio
+-async def test_failed_login_with_invalid_token_prefix(
+-    test_client: AsyncClient, test_user: UserDTO, jwt_token: str
+-) -> None:
+-    response = await test_client.get(
+-        url="/user", headers={"Authorization": f"JWTToken {jwt_token}"}
+-    )
+-    assert response.status_code == 403
+-
+-
+-@pytest.mark.anyio
+-async def test_failed_login_when_user_does_not_exist(
+-    test_client: AsyncClient, not_exists_jwt_token: str
+-) -> None:
+-    response = await test_client.get(
+-        url="/user", headers={"Authorization": f"Token {not_exists_jwt_token}"}
+-    )
+-    assert response.status_code == 404
+-
+-
+-@pytest.mark.anyio
+-async def test_user_can_not_get_profile_without_auth(
+-    test_client: AsyncClient, test_user: UserDTO
+-) -> None:
+-    response = await test_client.get(url="/user")
+-    assert response.status_code == 403
+-
+-
+-@pytest.mark.anyio
+-async def test_user_can_get_own_profile(
+-    authorized_test_client: AsyncClient, jwt_token: str
+-) -> None:
+-    response = await authorized_test_client.get(url="/user")
+-    assert response.status_code == 200
+-
+-
+-@pytest.mark.parametrize(
+-    "update_field, update_value",
+-    (
+-        ("username", "updated_username"),
+-        ("email", "updated_email@gmail.com"),
+-        ("bio", "Updated bio"),
+-        ("image", "https://image.com/best-image-ever"),
+-    ),
+-)
+-@pytest.mark.anyio
+-async def test_user_can_update_own_profile(
+-    authorized_test_client: AsyncClient,
+-    test_user: UserDTO,
+-    update_value: str,
+-    update_field: str,
+-) -> None:
+-    response = await authorized_test_client.put(
+-        url="/user", json={"user": {update_field: update_value}}
+-    )
+-    assert response.status_code == 200
+-
+-    updated_user = response.json()
+-    assert updated_user["user"][update_field] == update_value
+-
+-
+-@pytest.mark.anyio
+-async def test_user_can_change_password(
+-    authorized_test_client: AsyncClient,
+-    test_user: UserDTO,
+-    session: AsyncSession,
+-    user_repository: UserRepository,
+-) -> None:
+-    response = await authorized_test_client.put(
+-        url="/user", json={"user": {"password": "new_password"}}
+-    )
+-    assert response.status_code == 200
+-
+-    user = await user_repository.get_by_email(session=session, email=test_user.email)
+-    assert verify_password(
+-        plain_password="new_password", hashed_password=user.password_hash
+-    )
+-
+-
+-@pytest.mark.parametrize(
+-    "update_field, update_value",
+-    (("username", "taken_username"), ("email", "taken@gmail.com")),
+-)
+-@pytest.mark.anyio
+-async def test_user_can_not_use_taken_credentials(
+-    authorized_test_client: AsyncClient, update_field: str, update_value: str
+-) -> None:
+-    payload = {
+-        "user": {
+-            "username": "free_username",
+-            "password": "password",
+-            "email": "free_email@gmail.com",
+-        }
+-    }
+-    payload["user"].update({update_field: update_value})
+-    response = await authorized_test_client.post("/users", json=payload)
+-    assert response.status_code == 200
+-
+-    response = await authorized_test_client.put(
+-        url="/user", json={"user": {update_field: update_value}}
+-    )
+-    assert response.status_code == 400
+diff --git a/tests/api/routes/test_validation.py b/tests/api/routes/test_validation.py
+deleted file mode 100644
+index 0162645..0000000
+--- a/tests/api/routes/test_validation.py
++++ /dev/null
+@@ -1,86 +0,0 @@
+-import pytest
+-from httpx import AsyncClient
+-
+-from conduit.dtos.domain.article import ArticleDTO
+-
+-
+-@pytest.mark.parametrize(
+-    "payload",
+-    (
+-        {
+-            "user": {
+-                "email": "not-an-email",
+-                "username": "validuser",
+-                "password": "password",
+-            }
+-        },
+-        {
+-            "user": {
+-                "email": "user@example.com",
+-                "username": "ab",
+-                "password": "password",
+-            }
+-        },
+-        {
+-            "user": {
+-                "email": "user@example.com",
+-                "username": "validuser",
+-                "password": "short",
+-            }
+-        },
+-    ),
+-)
+-@pytest.mark.anyio
+-async def test_user_registration_validation_errors(
+-    test_client: AsyncClient, payload: dict
+-) -> None:
+-    response = await test_client.post("/users", json=payload)
+-    assert response.status_code == 422
+-
+-
+-@pytest.mark.parametrize(
+-    "payload",
+-    (
+-        {
+-            "article": {
+-                "title": "abcd",
+-                "description": "long enough description",
+-                "body": "long enough body",
+-                "tagList": [],
+-            }
+-        },
+-        {
+-            "article": {
+-                "title": "Valid Title",
+-                "description": "short",
+-                "body": "long enough body",
+-                "tagList": [],
+-            }
+-        },
+-        {
+-            "article": {
+-                "title": "Valid Title",
+-                "description": "long enough description",
+-                "body": "short",
+-                "tagList": [],
+-            }
+-        },
+-    ),
+-)
+-@pytest.mark.anyio
+-async def test_article_create_validation_errors(
+-    authorized_test_client: AsyncClient, payload: dict
+-) -> None:
+-    response = await authorized_test_client.post("/articles", json=payload)
+-    assert response.status_code == 422
+-
+-
+-@pytest.mark.anyio
+-async def test_comment_create_validation_error(
+-    authorized_test_client: AsyncClient, test_article: ArticleDTO
+-) -> None:
+-    response = await authorized_test_client.post(
+-        url=f"/articles/{test_article.slug}/comments",
+-        json={"comment": {"body": ""}},
+-    )
+-    assert response.status_code == 422
+diff --git a/tests/api/test_dependency_overrides.py b/tests/api/test_dependency_overrides.py
+deleted file mode 100644
+index 17ef0bd..0000000
+--- a/tests/api/test_dependency_overrides.py
++++ /dev/null
+@@ -1,35 +0,0 @@
+-import datetime
+-
+-import pytest
+-from fastapi import FastAPI
+-from httpx import AsyncClient
+-
+-from conduit.core.providers import get_tag_service
+-from conduit.dtos.domain.tag import TagDTO
+-
+-
+-class _TagServiceStub:
+-    async def get_all_tags(self, *_: object, **__: object) -> list[TagDTO]:
+-        return [
+-            TagDTO(id=1, tag="override", created_at=datetime.datetime(2024, 1, 1)),
+-            TagDTO(id=2, tag="stubbed", created_at=datetime.datetime(2024, 1, 2)),
+-        ]
+-
+-
+-@pytest.mark.anyio
+-async def test_dependency_override_tag_service(application: FastAPI) -> None:
+-    async def _override_tag_service() -> _TagServiceStub:
+-        return _TagServiceStub()
+-
+-    application.dependency_overrides[get_tag_service] = _override_tag_service
+-    try:
+-        async with AsyncClient(
+-            app=application,
+-            base_url="http://testserver/api",
+-            headers={"Content-Type": "application/json"},
+-        ) as client:
+-            response = await client.get(url="/tags")
+-        assert response.status_code == 200
+-        assert response.json() == {"tags": ["override", "stubbed"]}
+-    finally:
+-        application.dependency_overrides.pop(get_tag_service, None)
+diff --git a/tests/conftest.py b/tests/conftest.py
+deleted file mode 100644
+index 2b64429..0000000
+--- a/tests/conftest.py
++++ /dev/null
+@@ -1,190 +0,0 @@
+-import os
+-from collections.abc import Generator
+-from datetime import datetime
+-from typing import TypeAlias
+-
+-import pytest
+-from fastapi import FastAPI
+-from httpx import AsyncClient
+-from sqlalchemy import create_engine
+-from sqlalchemy.ext.asyncio import AsyncSession
+-from sqlalchemy_utils import create_database, database_exists, drop_database
+-
+-from conduit.app import create_app
+-from conduit.core.config import get_app_settings
+-from conduit.core.container import Container
+-from conduit.core.dependencies import IArticleService, IAuthTokenService
+-from conduit.core.settings.base import BaseAppSettings
+-from conduit.dtos.domain.article import ArticleDTO, CreateArticleDTO
+-from conduit.dtos.domain.user import CreateUserDTO, UserDTO
+-from conduit.infrastructure.models import Base
+-from conduit.interfaces.repositories.article import IArticleRepository
+-from conduit.interfaces.repositories.user import IUserRepository
+-from conduit.interfaces.services.user import IUserService
+-
+-SetupFixture: TypeAlias = None
+-
+-
+-@pytest.fixture
+-def anyio_backend() -> str:
+-    return "asyncio"
+-
+-
+-@pytest.fixture(autouse=True)
+-def check_app_env_mode_enabled() -> None:
+-    assert os.getenv("APP_ENV") == "test"
+-
+-
+-@pytest.fixture(scope="session")
+-def create_test_db(settings: BaseAppSettings) -> Generator[None, None, None]:
+-    test_db_sql_uri = settings.sql_db_uri.set(drivername="postgresql")
+-
+-    if database_exists(url=test_db_sql_uri):
+-        drop_database(url=test_db_sql_uri)
+-
+-    create_database(url=test_db_sql_uri)
+-    yield
+-
+-    drop_database(url=test_db_sql_uri)
+-
+-
+-@pytest.fixture(autouse=True)
+-def create_tables(settings: BaseAppSettings) -> Generator[None, None, None]:
+-    engine = create_engine(
+-        url=settings.sql_db_uri.set(drivername="postgresql"),
+-        isolation_level="AUTOCOMMIT",
+-    )
+-    Base.metadata.create_all(bind=engine)
+-    yield
+-
+-    Base.metadata.drop_all(bind=engine)
+-
+-
+-@pytest.fixture(scope="session")
+-def application(create_test_db: SetupFixture) -> FastAPI:
+-    return create_app()
+-
+-
+-@pytest.fixture(scope="session")
+-def settings() -> BaseAppSettings:
+-    return get_app_settings()
+-
+-
+-@pytest.fixture(scope="session")
+-def di_container(settings: BaseAppSettings) -> Container:
+-    return Container(settings=settings)
+-
+-
+-@pytest.fixture
+-async def session(di_container: Container) -> AsyncSession:
+-    async with di_container.context_session() as session:
+-        yield session
+-
+-
+-@pytest.fixture
+-def user_repository(di_container: Container) -> IUserRepository:
+-    return di_container.user_repository()
+-
+-
+-@pytest.fixture
+-def article_repository(di_container: Container) -> IArticleRepository:
+-    return di_container.article_repository()
+-
+-
+-@pytest.fixture
+-def article_service(di_container: Container) -> IArticleService:
+-    return di_container.article_service()
+-
+-
+-@pytest.fixture
+-def auth_token_service(di_container: Container) -> IAuthTokenService:
+-    return di_container.auth_token_service()
+-
+-
+-@pytest.fixture
+-def user_service(di_container: Container) -> IUserService:
+-    return di_container.user_service()
+-
+-
+-@pytest.fixture
+-def user_to_create() -> CreateUserDTO:
+-    return CreateUserDTO(username="test", email="test@gmail.com", password="password")
+-
+-
+-@pytest.fixture
+-def article_to_create() -> CreateArticleDTO:
+-    return CreateArticleDTO(
+-        title="Test Article",
+-        description="Test Description",
+-        body="Test Body Content",
+-        tags=["tag1", "tag2"],
+-    )
+-
+-
+-@pytest.fixture
+-def not_exists_user() -> UserDTO:
+-    return UserDTO(
+-        id=9999,
+-        username="username",
+-        email="email",
+-        password_hash="hash",
+-        bio="bio",
+-        image="link",
+-        created_at=datetime.now(),
+-    )
+-
+-
+-@pytest.fixture
+-async def test_user(
+-    session: AsyncSession, user_service: IUserService, user_to_create: CreateUserDTO
+-) -> UserDTO:
+-    return await user_service.create_user(
+-        session=session, user_to_create=user_to_create
+-    )
+-
+-
+-@pytest.fixture
+-async def test_article(
+-    session: AsyncSession,
+-    article_service: IArticleService,
+-    article_to_create: CreateArticleDTO,
+-    test_user: UserDTO,
+-) -> ArticleDTO:
+-    return await article_service.create_new_article(
+-        session=session, author_id=test_user.id, article_to_create=article_to_create
+-    )
+-
+-
+-@pytest.fixture
+-async def jwt_token(auth_token_service: IAuthTokenService, test_user: UserDTO) -> str:
+-    return auth_token_service.generate_jwt_token(user=test_user)
+-
+-
+-@pytest.fixture
+-async def not_exists_jwt_token(
+-    auth_token_service: IAuthTokenService, not_exists_user: UserDTO
+-) -> str:
+-    return auth_token_service.generate_jwt_token(user=not_exists_user)
+-
+-
+-@pytest.fixture
+-async def test_client(application: FastAPI) -> AsyncClient:
+-    async with AsyncClient(
+-        app=application,
+-        base_url="http://testserver/api",
+-        headers={"Content-Type": "application/json"},
+-    ) as client:
+-        yield client
+-
+-
+-@pytest.fixture
+-async def authorized_test_client(application: FastAPI, jwt_token: str) -> AsyncClient:
+-    async with AsyncClient(
+-        app=application,
+-        base_url="http://testserver/api",
+-        headers={
+-            "Authorization": f"Token {jwt_token}",
+-            "Content-Type": "application/json",
+-        },
+-    ) as client:
+-        yield client
+diff --git a/tests/core/__init__.py b/tests/core/__init__.py
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/tests/core/utils/__init__.py b/tests/core/utils/__init__.py
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/tests/core/utils/test_errors.py b/tests/core/utils/test_errors.py
+deleted file mode 100644
+index d25d4e3..0000000
+--- a/tests/core/utils/test_errors.py
++++ /dev/null
+@@ -1,44 +0,0 @@
+-from typing import Any
+-
+-import pytest
+-from fastapi import FastAPI
+-
+-from conduit.core.utils.errors import get_or_raise
+-
+-
+-@pytest.fixture(scope="session", autouse=True)
+-def create_test_db() -> None:
+-    return
+-
+-
+-@pytest.fixture(scope="session", autouse=True)
+-def create_tables() -> None:
+-    return
+-
+-
+-class TestException(Exception):
+-    pass
+-
+-
+-async def mock_awaitable(result: Any) -> Any:
+-    return result
+-
+-
+-@pytest.mark.anyio
+-async def test_get_or_raise_returns_value(application: FastAPI) -> None:
+-    result = await get_or_raise(mock_awaitable("expected_value"), TestException())
+-    assert result == "expected_value"
+-
+-
+-@pytest.mark.anyio
+-async def test_get_or_raise_raises_exception(application: FastAPI) -> None:
+-    with pytest.raises(TestException):
+-        await get_or_raise(mock_awaitable(None), TestException())
+-
+-
+-@pytest.mark.anyio
+-async def test_get_or_raise_raises_custom_exception_message(
+-    application: FastAPI,
+-) -> None:
+-    with pytest.raises(TestException, match="Custom error message"):
+-        await get_or_raise(mock_awaitable(None), TestException("Custom error message"))
+diff --git a/tests/services/test_create_failures.py b/tests/services/test_create_failures.py
+deleted file mode 100644
+index 253b8c9..0000000
+--- a/tests/services/test_create_failures.py
++++ /dev/null
+@@ -1,122 +0,0 @@
+-import datetime
+-
+-import pytest
+-from sqlalchemy.exc import NoResultFound
+-
+-from conduit.core.exceptions import (
+-    ArticleCreateException,
+-    CommentCreateException,
+-    UserCreateException,
+-)
+-from conduit.dtos.domain.article import CreateArticleDTO
+-from conduit.dtos.domain.comment import CreateCommentDTO
+-from conduit.dtos.domain.user import CreateUserDTO, UserDTO
+-from conduit.dtos.records.article import ArticleRecordDTO
+-from conduit.services.article import ArticleService
+-from conduit.services.comment import CommentService
+-from conduit.services.user import UserService
+-
+-
+-class _FailingArticleRepo:
+-    async def add(self, *_: object, **__: object) -> ArticleRecordDTO:
+-        raise NoResultFound()
+-
+-
+-class _FailingUserRepo:
+-    async def get_by_email_or_none(self, *_: object, **__: object) -> UserDTO | None:
+-        return None
+-
+-    async def get_by_username_or_none(self, *_: object, **__: object) -> UserDTO | None:
+-        return None
+-
+-    async def add(self, *_: object, **__: object) -> UserDTO:
+-        raise NoResultFound()
+-
+-
+-class _FailingCommentRepo:
+-    async def add(self, *_: object, **__: object) -> object:
+-        raise NoResultFound()
+-
+-
+-class _ArticleRepo:
+-    async def get_by_slug(self, *_: object, **__: object) -> ArticleRecordDTO:
+-        return ArticleRecordDTO(
+-            id=1,
+-            author_id=1,
+-            slug="article-slug",
+-            title="title",
+-            description="description",
+-            body="body",
+-            created_at=datetime.datetime.now(),
+-            updated_at=datetime.datetime.now(),
+-        )
+-
+-
+-class _NoopArticleTagRepo:
+-    async def add_many(self, *_: object, **__: object) -> list[object]:
+-        return []
+-
+-
+-class _NoopFavoriteRepo:
+-    async def count(self, *_: object, **__: object) -> int:
+-        return 0
+-
+-    async def exists(self, *_: object, **__: object) -> bool:
+-        return False
+-
+-
+-class _NoopProfileService:
+-    async def get_profile_by_user_id(self, *_: object, **__: object) -> object:
+-        raise AssertionError("Not expected to be called")
+-
+-
+-@pytest.mark.anyio
+-async def test_article_create_raises_create_exception() -> None:
+-    service = ArticleService(
+-        article_repo=_FailingArticleRepo(),
+-        article_tag_repo=_NoopArticleTagRepo(),
+-        favorite_repo=_NoopFavoriteRepo(),
+-        profile_service=_NoopProfileService(),
+-    )
+-    create_article_dto = CreateArticleDTO(
+-        title="title", description="desc", body="body", tags=[]
+-    )
+-    with pytest.raises(ArticleCreateException):
+-        await service.create_new_article(
+-            session=None, author_id=1, article_to_create=create_article_dto
+-        )
+-
+-
+-@pytest.mark.anyio
+-async def test_user_create_raises_create_exception() -> None:
+-    service = UserService(user_repo=_FailingUserRepo())
+-    create_user_dto = CreateUserDTO(
+-        username="user", email="user@example.com", password="secret"
+-    )
+-    with pytest.raises(UserCreateException):
+-        await service.create_user(session=None, user_to_create=create_user_dto)
+-
+-
+-@pytest.mark.anyio
+-async def test_comment_create_raises_create_exception() -> None:
+-    current_user = UserDTO(
+-        id=1,
+-        username="user",
+-        email="user@example.com",
+-        password_hash="hash",
+-        bio="",
+-        image="",
+-        created_at=datetime.datetime.now(),
+-    )
+-    service = CommentService(
+-        article_repo=_ArticleRepo(),
+-        comment_repo=_FailingCommentRepo(),
+-        profile_service=_NoopProfileService(),
+-    )
+-    with pytest.raises(CommentCreateException):
+-        await service.create_article_comment(
+-            session=None,
+-            slug="article-slug",
+-            comment_to_create=CreateCommentDTO(body="body"),
+-            current_user=current_user,
+-        )
+diff --git a/tests/utils.py b/tests/utils.py
+deleted file mode 100644
+index 1c4321f..0000000
+--- a/tests/utils.py
++++ /dev/null
+@@ -1,32 +0,0 @@
+-from sqlalchemy.ext.asyncio import AsyncSession
+-
+-from conduit.dtos.domain.article import CreateArticleDTO
+-from conduit.dtos.domain.user import CreateUserDTO, UserDTO
+-from conduit.dtos.records.article import ArticleRecordDTO
+-from conduit.infrastructure.repositories.article import ArticleRepository
+-from conduit.interfaces.services.user import IUserService
+-
+-
+-async def create_another_test_user(
+-    session: AsyncSession, user_service: IUserService
+-) -> UserDTO:
+-    create_user_dto = CreateUserDTO(
+-        username="temp-user", email="temp-user@gmail.com", password="password"
+-    )
+-    return await user_service.create_user(
+-        session=session, user_to_create=create_user_dto
+-    )
+-
+-
+-async def create_another_test_article(
+-    session: AsyncSession, article_repository: ArticleRepository, author_id: int
+-) -> ArticleRecordDTO:
+-    create_article_dto = CreateArticleDTO(
+-        title="One More Test Article",
+-        description="Test Description",
+-        body="Test Body Content",
+-        tags=["tag1", "tag2", "tag3"],
+-    )
+-    return await article_repository.add(
+-        session=session, author_id=author_id, create_item=create_article_dto
+-    )

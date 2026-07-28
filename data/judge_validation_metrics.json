@@ -1,0 +1,43 @@
+{
+  "accuracy": 0.98,
+  "kappa": 0.9752597723899059,
+  "per_category": {
+    "auth_misconfiguration": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "support": 11
+    },
+    "incorrect_query_logic": {
+      "precision": 0.9230769230769231,
+      "recall": 1.0,
+      "f1": 0.9600000000000001,
+      "support": 12
+    },
+    "state_propagation_failure": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "support": 5
+    },
+    "database_runtime_error": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "support": 11
+    },
+    "framework_idiosyncrasy": {
+      "precision": 1.0,
+      "recall": 0.8,
+      "f1": 0.888888888888889,
+      "support": 5
+    },
+    "business_logic_defect": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "support": 6
+    }
+  },
+  "macro_f1": 0.9748148148148149
+}

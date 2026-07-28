@@ -1,0 +1,94 @@
+[tool.poetry]
+name = "realworld-aiohttp"
+version = "0.1.0"
+description = """\
+    Python / AIOHTTP codebase containing real world examples (CRUD, auth, advanced patterns, etc)\
+    that adheres to the RealWorld spec and API.\
+"""
+authors = ["Stanislav Kiriukhin <st.krizh@gmail.com>"]
+readme = "README.md"
+
+
+[tool.poetry.dependencies]
+python = ">=3.11"
+aiohttp = "^3.9.1"
+aiohttp-apispec = "^2.2.3"
+argon2-cffi = "^23.1.0"
+asyncpg = "^0.29.0"
+dependency-injector = "^4.41.0"
+dynaconf = "^3.2.4"
+marshmallow = "^3.21.0"
+pyjwt = "^2.8.0"
+python-slugify = "^8.0.4"
+sqlalchemy = "^2.0.25"
+structlog = "^24.1.0"
+yarl = "^1.9.4"
+
+
+[tool.poetry.group.migrations.dependencies]
+alembic = "^1.13.1"
+dynaconf = "^3.2.4"
+psycopg2-binary = "^2.9.9"
+
+
+[tool.poetry.group.dev.dependencies]
+mypy = "^1.8.0"
+pytest = "^7.4.4"
+pytest-aiohttp = "^1.0.5"
+pytest-asyncio = "^0.23.3"
+pytest-cov = "^4.1.0"
+ruff = "^0.1.13"
+
+
+[tool.mypy]
+python_version = "3.11"
+files = ["conduit/", "migrations/", "tests/"]
+strict = true
+warn_unreachable = true
+show_error_context = true
+pretty = true
+
+
+[[tool.mypy.overrides]]
+module = ["dynaconf.*", "aiohttp_apispec.*", "pytest_aiohttp.*"]
+ignore_missing_imports = true
+
+
+[[tool.mypy.overrides]]
+module = ["conduit.api.*"]
+allow_untyped_decorators = true
+warn_return_any = false
+
+
+[tool.ruff]
+include = ["conduit/**/*.py", "migrations/**/*.py", "tests/**/*.py"]
+line-length = 120
+
+
+[tool.ruff.lint]
+select = ["B", "D", "E", "F", "I", "N", "UP", "W"]
+ignore = ["D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107", "D203", "D213"]
+
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+
+[tool.pytest.ini_options]
+addopts = [
+    "--disable-warnings",
+    "--cov=conduit",
+    "--cov-report=term-missing",
+]
+asyncio_mode = "auto"
+console_output_style = "count"
+testpaths = ["tests"]
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
